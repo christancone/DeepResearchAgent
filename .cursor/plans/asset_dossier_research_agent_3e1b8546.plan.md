@@ -68,6 +68,24 @@ todos:
   - id: integrate-budget
     content: Integrate budget management into agent base class via mixin
     status: pending
+  - id: event-types
+    content: Define all observable event types and AgentEvent dataclass
+    status: pending
+  - id: event-emitter
+    content: Implement EventEmitter singleton with subscribe/emit pattern
+    status: pending
+  - id: console-monitor
+    content: Create ConsoleLiveMonitor and SimpleConsoleLogger for real-time display
+    status: pending
+  - id: observable-mixin
+    content: Create ObservableMixin for easy agent instrumentation
+    status: pending
+  - id: langfuse-integration
+    content: Add Langfuse/LangSmith handler for external observability (optional)
+    status: pending
+  - id: integrate-observability
+    content: Integrate ObservableMixin into all agents and entry points
+    status: pending
 isProject: false
 ---
 
@@ -2827,6 +2845,891 @@ Add these to the plan header:
     status: pending
 ```
 
+## Phase 9: Agent Observability & Live Monitoring
+
+### 9.1 Current State (What Already Exists)
+
+The codebase has basic observability:
+
+| Component | Location | What It Does |
+|-----------|----------|--------------|
+| `AgentLogger` | `src/logger/logger.py` | Rich console output, markdown rendering |
+| `Monitor` | `src/logger/monitor.py` | Token usage and step timing |
+| `AgentMemory` | `src/memory/memory.py` | Step recording (ActionStep, PlanningStep, etc.) |
+| `visualize_agent_tree()` | Logger | Shows agent hierarchy tree |
+| Streaming | Base agent | Yields steps as they execute |
+
+**What's Missing**:
+- Real-time dashboard showing agent activity
+- Clear "Agent X is doing Y" messages
+- Tool call visualization with arguments
+- Plan changes tracking
+- Thinking/reasoning visibility
+- Event streaming to external systems (Langfuse, LangSmith)
+
+### 9.2 Event Types for Observability
+
+**File**: `src/observability/events.py`
+
+```python
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Literal
+from enum import Enum
+import json
+
+class EventType(Enum):
+    """All observable events in the agent system."""
+    # Agent lifecycle
+    AGENT_STARTED = "agent.started"
+    AGENT_COMPLETED = "agent.completed"
+    AGENT_ERROR = "agent.error"
+    
+    # Thinking & reasoning
+    AGENT_THINKING = "agent.thinking"
+    AGENT_REASONING = "agent.reasoning"
+    
+    # Tool usage
+    TOOL_CALLED = "tool.called"
+    TOOL_STARTED = "tool.started"
+    TOOL_COMPLETED = "tool.completed"
+    TOOL_ERROR = "tool.error"
+    
+    # Planning
+    PLAN_CREATED = "plan.created"
+    PLAN_UPDATED = "plan.updated"
+    PLAN_STEP_STARTED = "plan.step.started"
+    PLAN_STEP_COMPLETED = "plan.step.completed"
+    
+    # Managed agents
+    MANAGED_AGENT_DELEGATED = "managed_agent.delegated"
+    MANAGED_AGENT_RESPONSE = "managed_agent.response"
+    
+    # Memory & context
+    CONTEXT_BUDGET_WARNING = "context.budget.warning"
+    CONTEXT_TRUNCATED = "context.truncated"
+    CANVAS_ENTRY_ADDED = "canvas.entry.added"
+    CANVAS_RETRIEVED = "canvas.retrieved"
+    
+    # Final answer
+    FINAL_ANSWER_GENERATED = "final_answer.generated"
+
+@dataclass
+class AgentEvent:
+    """A single observable event from the agent system."""
+    event_type: EventType
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    agent_name: str = ""
+    agent_type: str = ""
+    step_number: int = 0
+    
+    # Event-specific data
+    data: Dict[str, Any] = field(default_factory=dict)
+    
+    # Context
+    parent_agent: Optional[str] = None  # For managed agents
+    trace_id: str = ""  # For distributed tracing
+    span_id: str = ""
+    
+    # Metrics
+    duration_ms: Optional[int] = None
+    token_count: Optional[int] = None
+    
+    def to_dict(self) -> dict:
+        return {
+            "event_type": self.event_type.value,
+            "timestamp": self.timestamp.isoformat(),
+            "agent_name": self.agent_name,
+            "agent_type": self.agent_type,
+            "step_number": self.step_number,
+            "data": self.data,
+            "parent_agent": self.parent_agent,
+            "trace_id": self.trace_id,
+            "span_id": self.span_id,
+            "duration_ms": self.duration_ms,
+            "token_count": self.token_count
+        }
+    
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str)
+    
+    def to_human_readable(self) -> str:
+        """Format event for human-readable console output."""
+        icon = EVENT_ICONS.get(self.event_type, "•")
+        
+        if self.event_type == EventType.AGENT_STARTED:
+            return f"{icon} [{self.agent_name}] Started: {self.data.get('task', '')[:100]}..."
+        
+        elif self.event_type == EventType.AGENT_THINKING:
+            thought = self.data.get('thought', '')[:200]
+            return f"{icon} [{self.agent_name}] Thinking: {thought}..."
+        
+        elif self.event_type == EventType.TOOL_CALLED:
+            tool = self.data.get('tool_name', 'unknown')
+            args = self.data.get('arguments', {})
+            args_str = json.dumps(args)[:100]
+            return f"{icon} [{self.agent_name}] Calling tool: {tool}({args_str}...)"
+        
+        elif self.event_type == EventType.TOOL_COMPLETED:
+            tool = self.data.get('tool_name', 'unknown')
+            duration = self.duration_ms or 0
+            return f"{icon} [{self.agent_name}] Tool completed: {tool} ({duration}ms)"
+        
+        elif self.event_type == EventType.PLAN_CREATED:
+            steps = self.data.get('steps', [])
+            return f"{icon} [{self.agent_name}] Created plan with {len(steps)} steps"
+        
+        elif self.event_type == EventType.PLAN_UPDATED:
+            change = self.data.get('change_description', 'updated')
+            return f"{icon} [{self.agent_name}] Plan changed: {change}"
+        
+        elif self.event_type == EventType.MANAGED_AGENT_DELEGATED:
+            target = self.data.get('target_agent', 'unknown')
+            task = self.data.get('task', '')[:80]
+            return f"{icon} [{self.agent_name}] → Delegating to [{target}]: {task}..."
+        
+        elif self.event_type == EventType.MANAGED_AGENT_RESPONSE:
+            source = self.data.get('source_agent', 'unknown')
+            summary = self.data.get('summary', '')[:100]
+            return f"{icon} [{source}] → [{self.agent_name}]: {summary}..."
+        
+        elif self.event_type == EventType.FINAL_ANSWER_GENERATED:
+            return f"{icon} [{self.agent_name}] ✓ Final answer generated"
+        
+        elif self.event_type == EventType.CONTEXT_BUDGET_WARNING:
+            usage = self.data.get('usage_percent', 0)
+            return f"{icon} [{self.agent_name}] ⚠ Context at {usage:.1f}% capacity"
+        
+        else:
+            return f"{icon} [{self.agent_name}] {self.event_type.value}: {self.data}"
+
+# Icons for console output
+EVENT_ICONS = {
+    EventType.AGENT_STARTED: "🚀",
+    EventType.AGENT_COMPLETED: "✅",
+    EventType.AGENT_ERROR: "❌",
+    EventType.AGENT_THINKING: "🤔",
+    EventType.AGENT_REASONING: "💭",
+    EventType.TOOL_CALLED: "🔧",
+    EventType.TOOL_STARTED: "⏳",
+    EventType.TOOL_COMPLETED: "✓",
+    EventType.TOOL_ERROR: "⚠️",
+    EventType.PLAN_CREATED: "📋",
+    EventType.PLAN_UPDATED: "📝",
+    EventType.PLAN_STEP_STARTED: "▶️",
+    EventType.PLAN_STEP_COMPLETED: "☑️",
+    EventType.MANAGED_AGENT_DELEGATED: "📤",
+    EventType.MANAGED_AGENT_RESPONSE: "📥",
+    EventType.CONTEXT_BUDGET_WARNING: "⚠️",
+    EventType.CONTEXT_TRUNCATED: "✂️",
+    EventType.CANVAS_ENTRY_ADDED: "📌",
+    EventType.CANVAS_RETRIEVED: "🔍",
+    EventType.FINAL_ANSWER_GENERATED: "🎯",
+}
+```
+
+### 9.3 Event Emitter & Subscribers
+
+**File**: `src/observability/emitter.py`
+
+```python
+from typing import Callable, List, Dict, Any, Optional
+from collections import defaultdict
+import asyncio
+from datetime import datetime
+import uuid
+
+from src.observability.events import AgentEvent, EventType
+
+# Type for event handlers
+EventHandler = Callable[[AgentEvent], None]
+AsyncEventHandler = Callable[[AgentEvent], asyncio.Future]
+
+class EventEmitter:
+    """
+    Central event emitter for agent observability.
+    
+    Supports multiple subscribers and both sync/async handlers.
+    """
+    
+    _instance: Optional['EventEmitter'] = None
+    
+    def __init__(self):
+        self._handlers: Dict[EventType, List[EventHandler]] = defaultdict(list)
+        self._async_handlers: Dict[EventType, List[AsyncEventHandler]] = defaultdict(list)
+        self._all_handlers: List[EventHandler] = []
+        self._async_all_handlers: List[AsyncEventHandler] = []
+        self._trace_id: str = ""
+        self._event_history: List[AgentEvent] = []
+        self._max_history = 1000
+    
+    @classmethod
+    def get_instance(cls) -> 'EventEmitter':
+        """Get singleton instance."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+    
+    def start_trace(self) -> str:
+        """Start a new trace for this execution."""
+        self._trace_id = f"trace_{uuid.uuid4().hex[:16]}"
+        self._event_history = []
+        return self._trace_id
+    
+    def subscribe(
+        self, 
+        event_type: Optional[EventType], 
+        handler: EventHandler
+    ):
+        """
+        Subscribe to events.
+        
+        Args:
+            event_type: Specific event type, or None for all events
+            handler: Sync callback function
+        """
+        if event_type is None:
+            self._all_handlers.append(handler)
+        else:
+            self._handlers[event_type].append(handler)
+    
+    def subscribe_async(
+        self,
+        event_type: Optional[EventType],
+        handler: AsyncEventHandler
+    ):
+        """Subscribe with async handler."""
+        if event_type is None:
+            self._async_all_handlers.append(handler)
+        else:
+            self._async_handlers[event_type].append(handler)
+    
+    def emit(self, event: AgentEvent):
+        """Emit an event to all subscribers."""
+        # Add trace context
+        event.trace_id = self._trace_id
+        if not event.span_id:
+            event.span_id = f"span_{uuid.uuid4().hex[:12]}"
+        
+        # Store in history
+        self._event_history.append(event)
+        if len(self._event_history) > self._max_history:
+            self._event_history = self._event_history[-self._max_history:]
+        
+        # Call sync handlers
+        for handler in self._all_handlers:
+            try:
+                handler(event)
+            except Exception as e:
+                print(f"Error in event handler: {e}")
+        
+        for handler in self._handlers.get(event.event_type, []):
+            try:
+                handler(event)
+            except Exception as e:
+                print(f"Error in event handler: {e}")
+    
+    async def emit_async(self, event: AgentEvent):
+        """Emit event and await async handlers."""
+        self.emit(event)  # Also call sync handlers
+        
+        # Call async handlers
+        tasks = []
+        for handler in self._async_all_handlers:
+            tasks.append(handler(event))
+        
+        for handler in self._async_handlers.get(event.event_type, []):
+            tasks.append(handler(event))
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    
+    def get_history(
+        self,
+        event_types: Optional[List[EventType]] = None,
+        agent_name: Optional[str] = None,
+        limit: int = 100
+    ) -> List[AgentEvent]:
+        """Get event history with optional filtering."""
+        events = self._event_history
+        
+        if event_types:
+            events = [e for e in events if e.event_type in event_types]
+        
+        if agent_name:
+            events = [e for e in events if e.agent_name == agent_name]
+        
+        return events[-limit:]
+
+# Convenience function for emitting events
+def emit_event(
+    event_type: EventType,
+    agent_name: str = "",
+    agent_type: str = "",
+    step_number: int = 0,
+    parent_agent: Optional[str] = None,
+    duration_ms: Optional[int] = None,
+    token_count: Optional[int] = None,
+    **data
+):
+    """Convenience function to emit an event."""
+    event = AgentEvent(
+        event_type=event_type,
+        agent_name=agent_name,
+        agent_type=agent_type,
+        step_number=step_number,
+        parent_agent=parent_agent,
+        duration_ms=duration_ms,
+        token_count=token_count,
+        data=data
+    )
+    EventEmitter.get_instance().emit(event)
+    return event
+```
+
+### 9.4 Console Live Monitor
+
+**File**: `src/observability/console_monitor.py`
+
+```python
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.tree import Tree
+from rich.text import Text
+from rich.layout import Layout
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from collections import deque
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+
+from src.observability.events import AgentEvent, EventType, EVENT_ICONS
+from src.observability.emitter import EventEmitter
+
+class ConsoleLiveMonitor:
+    """
+    Real-time console display of agent activity.
+    
+    Shows:
+    - Current agent and what it's doing
+    - Recent events stream
+    - Active plan and progress
+    - Tool calls with timing
+    - Token/context usage
+    """
+    
+    def __init__(self, max_events: int = 20):
+        self.console = Console()
+        self.recent_events: deque = deque(maxlen=max_events)
+        self.current_agent: str = ""
+        self.current_action: str = ""
+        self.active_plan: Optional[Dict[str, Any]] = None
+        self.token_usage: Dict[str, int] = {"input": 0, "output": 0}
+        self.context_usage_percent: float = 0.0
+        self.start_time: Optional[datetime] = None
+        self._live: Optional[Live] = None
+    
+    def start(self):
+        """Start the live monitor."""
+        self.start_time = datetime.utcnow()
+        
+        # Subscribe to all events
+        emitter = EventEmitter.get_instance()
+        emitter.subscribe(None, self._handle_event)
+        
+        # Start live display
+        self._live = Live(
+            self._build_display(),
+            console=self.console,
+            refresh_per_second=4
+        )
+        self._live.start()
+    
+    def stop(self):
+        """Stop the live monitor."""
+        if self._live:
+            self._live.stop()
+    
+    def _handle_event(self, event: AgentEvent):
+        """Handle incoming events."""
+        self.recent_events.append(event)
+        
+        # Update state based on event type
+        if event.event_type == EventType.AGENT_STARTED:
+            self.current_agent = event.agent_name
+            self.current_action = f"Starting: {event.data.get('task', '')[:50]}..."
+        
+        elif event.event_type == EventType.AGENT_THINKING:
+            self.current_agent = event.agent_name
+            self.current_action = f"Thinking: {event.data.get('thought', '')[:50]}..."
+        
+        elif event.event_type == EventType.TOOL_CALLED:
+            self.current_action = f"Calling: {event.data.get('tool_name', 'unknown')}"
+        
+        elif event.event_type == EventType.PLAN_CREATED:
+            self.active_plan = event.data
+        
+        elif event.event_type == EventType.PLAN_UPDATED:
+            if self.active_plan:
+                self.active_plan.update(event.data)
+        
+        elif event.event_type == EventType.CONTEXT_BUDGET_WARNING:
+            self.context_usage_percent = event.data.get('usage_percent', 0)
+        
+        # Update token usage
+        if event.token_count:
+            self.token_usage["input"] += event.token_count
+        
+        # Refresh display
+        if self._live:
+            self._live.update(self._build_display())
+    
+    def _build_display(self) -> Layout:
+        """Build the live display layout."""
+        layout = Layout()
+        
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="main"),
+            Layout(name="footer", size=3)
+        )
+        
+        layout["main"].split_row(
+            Layout(name="events", ratio=2),
+            Layout(name="status", ratio=1)
+        )
+        
+        # Header
+        elapsed = ""
+        if self.start_time:
+            elapsed = f" | Elapsed: {(datetime.utcnow() - self.start_time).seconds}s"
+        
+        layout["header"].update(
+            Panel(
+                f"[bold blue]🤖 Asset Research Agent[/] {elapsed}",
+                style="blue"
+            )
+        )
+        
+        # Events stream
+        events_table = Table(show_header=False, box=None, padding=(0, 1))
+        events_table.add_column("Time", style="dim", width=8)
+        events_table.add_column("Event", overflow="fold")
+        
+        for event in list(self.recent_events)[-15:]:
+            time_str = event.timestamp.strftime("%H:%M:%S")
+            events_table.add_row(time_str, event.to_human_readable())
+        
+        layout["events"].update(
+            Panel(events_table, title="[bold]Event Stream[/]", border_style="green")
+        )
+        
+        # Status panel
+        status_content = self._build_status_panel()
+        layout["status"].update(
+            Panel(status_content, title="[bold]Status[/]", border_style="yellow")
+        )
+        
+        # Footer
+        tokens = f"Tokens: {self.token_usage['input']:,} in / {self.token_usage['output']:,} out"
+        context = f"Context: {self.context_usage_percent:.1f}%"
+        layout["footer"].update(
+            Panel(f"{tokens} | {context}", style="dim")
+        )
+        
+        return layout
+    
+    def _build_status_panel(self) -> Text:
+        """Build the status panel content."""
+        text = Text()
+        
+        # Current agent
+        text.append("Agent: ", style="bold")
+        text.append(f"{self.current_agent}\n", style="cyan")
+        
+        # Current action
+        text.append("Action: ", style="bold")
+        text.append(f"{self.current_action}\n\n", style="white")
+        
+        # Active plan
+        if self.active_plan:
+            text.append("Plan:\n", style="bold")
+            steps = self.active_plan.get('steps', [])
+            for i, step in enumerate(steps[:5]):
+                status = step.get('status', 'pending')
+                icon = "✓" if status == 'completed' else "▶" if status == 'in_progress' else "○"
+                text.append(f"  {icon} {step.get('description', 'Step ' + str(i+1))}\n", 
+                           style="green" if status == 'completed' else "yellow" if status == 'in_progress' else "dim")
+        
+        return text
+
+
+class SimpleConsoleLogger:
+    """
+    Simple line-by-line console logger for agent events.
+    
+    Less fancy than LiveMonitor but works in all environments.
+    """
+    
+    def __init__(self, verbose: bool = True):
+        self.console = Console()
+        self.verbose = verbose
+        self.indent_level = 0
+    
+    def attach(self):
+        """Attach to event emitter."""
+        emitter = EventEmitter.get_instance()
+        emitter.subscribe(None, self._handle_event)
+    
+    def _handle_event(self, event: AgentEvent):
+        """Handle and print event."""
+        # Adjust indent for hierarchical display
+        if event.event_type == EventType.MANAGED_AGENT_DELEGATED:
+            self.indent_level += 1
+        elif event.event_type == EventType.MANAGED_AGENT_RESPONSE:
+            self.indent_level = max(0, self.indent_level - 1)
+        
+        indent = "  " * self.indent_level
+        
+        # Format based on verbosity
+        if self.verbose:
+            self.console.print(f"{indent}{event.to_human_readable()}")
+        else:
+            # Only show major events
+            if event.event_type in [
+                EventType.AGENT_STARTED,
+                EventType.AGENT_COMPLETED,
+                EventType.TOOL_COMPLETED,
+                EventType.PLAN_CREATED,
+                EventType.MANAGED_AGENT_DELEGATED,
+                EventType.FINAL_ANSWER_GENERATED
+            ]:
+                self.console.print(f"{indent}{event.to_human_readable()}")
+```
+
+### 9.5 Integration with Agents
+
+**File**: `src/agent/mixins/observable_mixin.py`
+
+```python
+from src.observability.events import EventType
+from src.observability.emitter import emit_event
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+class ObservableMixin:
+    """
+    Mixin that adds observability to agents.
+    
+    Automatically emits events for key agent actions.
+    """
+    
+    def _emit(
+        self,
+        event_type: EventType,
+        step_number: Optional[int] = None,
+        **data
+    ):
+        """Emit an event from this agent."""
+        emit_event(
+            event_type=event_type,
+            agent_name=getattr(self, 'name', 'unknown'),
+            agent_type=getattr(self, '__class__.__name__', 'Agent'),
+            step_number=step_number or getattr(self, 'step_number', 0),
+            parent_agent=getattr(self, '_parent_agent_name', None),
+            **data
+        )
+    
+    def emit_started(self, task: str):
+        """Emit agent started event."""
+        self._emit(EventType.AGENT_STARTED, task=task)
+    
+    def emit_thinking(self, thought: str):
+        """Emit thinking/reasoning event."""
+        self._emit(EventType.AGENT_THINKING, thought=thought)
+    
+    def emit_tool_call(self, tool_name: str, arguments: Dict[str, Any]):
+        """Emit tool called event."""
+        self._emit(
+            EventType.TOOL_CALLED,
+            tool_name=tool_name,
+            arguments=arguments
+        )
+    
+    def emit_tool_result(
+        self,
+        tool_name: str,
+        result: Any,
+        duration_ms: int,
+        error: Optional[str] = None
+    ):
+        """Emit tool completed event."""
+        event_type = EventType.TOOL_ERROR if error else EventType.TOOL_COMPLETED
+        self._emit(
+            event_type,
+            tool_name=tool_name,
+            result_preview=str(result)[:200] if result else None,
+            error=error,
+            duration_ms=duration_ms
+        )
+    
+    def emit_plan_created(self, steps: list):
+        """Emit plan created event."""
+        self._emit(
+            EventType.PLAN_CREATED,
+            steps=[{"description": s, "status": "pending"} for s in steps]
+        )
+    
+    def emit_plan_updated(self, change_description: str, steps: list):
+        """Emit plan updated event."""
+        self._emit(
+            EventType.PLAN_UPDATED,
+            change_description=change_description,
+            steps=steps
+        )
+    
+    def emit_delegation(self, target_agent: str, task: str):
+        """Emit managed agent delegation event."""
+        self._emit(
+            EventType.MANAGED_AGENT_DELEGATED,
+            target_agent=target_agent,
+            task=task
+        )
+    
+    def emit_delegation_response(self, source_agent: str, summary: str):
+        """Emit managed agent response event."""
+        self._emit(
+            EventType.MANAGED_AGENT_RESPONSE,
+            source_agent=source_agent,
+            summary=summary
+        )
+    
+    def emit_final_answer(self, answer_preview: str):
+        """Emit final answer event."""
+        self._emit(
+            EventType.FINAL_ANSWER_GENERATED,
+            answer_preview=answer_preview[:200]
+        )
+    
+    def emit_completed(self, success: bool = True):
+        """Emit agent completed event."""
+        event_type = EventType.AGENT_COMPLETED if success else EventType.AGENT_ERROR
+        self._emit(event_type, success=success)
+```
+
+### 9.6 External Integrations (Langfuse/LangSmith)
+
+**File**: `src/observability/integrations/langfuse_handler.py`
+
+```python
+from typing import Optional
+from src.observability.events import AgentEvent, EventType
+from src.observability.emitter import EventEmitter
+
+class LangfuseHandler:
+    """
+    Handler that sends events to Langfuse for observability.
+    
+    Requires: pip install langfuse
+    """
+    
+    def __init__(
+        self,
+        public_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        host: str = "https://cloud.langfuse.com"
+    ):
+        try:
+            from langfuse import Langfuse
+            self.langfuse = Langfuse(
+                public_key=public_key,
+                secret_key=secret_key,
+                host=host
+            )
+            self.traces = {}
+            self.spans = {}
+        except ImportError:
+            raise ImportError("langfuse not installed. Run: pip install langfuse")
+    
+    def attach(self):
+        """Attach to event emitter."""
+        emitter = EventEmitter.get_instance()
+        emitter.subscribe(None, self._handle_event)
+    
+    def _handle_event(self, event: AgentEvent):
+        """Convert agent event to Langfuse trace/span."""
+        
+        if event.event_type == EventType.AGENT_STARTED:
+            # Create new trace
+            trace = self.langfuse.trace(
+                id=event.trace_id,
+                name=f"Asset Research: {event.agent_name}",
+                input=event.data.get('task', ''),
+                metadata={"agent_type": event.agent_type}
+            )
+            self.traces[event.trace_id] = trace
+        
+        elif event.event_type == EventType.TOOL_CALLED:
+            # Create span for tool call
+            trace = self.traces.get(event.trace_id)
+            if trace:
+                span = trace.span(
+                    name=f"Tool: {event.data.get('tool_name', 'unknown')}",
+                    input=event.data.get('arguments', {})
+                )
+                self.spans[event.span_id] = span
+        
+        elif event.event_type == EventType.TOOL_COMPLETED:
+            # End tool span
+            span = self.spans.get(event.span_id)
+            if span:
+                span.end(output=event.data.get('result_preview', ''))
+        
+        elif event.event_type == EventType.AGENT_COMPLETED:
+            # End trace
+            trace = self.traces.get(event.trace_id)
+            if trace:
+                trace.update(
+                    output=event.data.get('result', ''),
+                    metadata={"success": event.data.get('success', True)}
+                )
+    
+    def flush(self):
+        """Flush pending events to Langfuse."""
+        self.langfuse.flush()
+```
+
+### 9.7 Usage Example
+
+**In entry point** (`examples/run_asset_research.py`):
+
+```python
+from src.observability.emitter import EventEmitter
+from src.observability.console_monitor import SimpleConsoleLogger, ConsoleLiveMonitor
+
+async def main():
+    args = parse_args()
+    
+    # Initialize observability
+    emitter = EventEmitter.get_instance()
+    trace_id = emitter.start_trace()
+    
+    # Choose display mode
+    if args.live_monitor:
+        # Rich live display (fancy terminal UI)
+        monitor = ConsoleLiveMonitor()
+        monitor.start()
+    else:
+        # Simple line-by-line logging
+        logger = SimpleConsoleLogger(verbose=args.verbose)
+        logger.attach()
+    
+    # Optional: Send to Langfuse
+    if os.environ.get("LANGFUSE_PUBLIC_KEY"):
+        from src.observability.integrations.langfuse_handler import LangfuseHandler
+        langfuse = LangfuseHandler()
+        langfuse.attach()
+    
+    try:
+        # Run agent...
+        agent = await create_agent(config)
+        result = await agent.run(task)
+    finally:
+        if args.live_monitor:
+            monitor.stop()
+        
+        # Print final summary
+        print_execution_summary(emitter.get_history())
+```
+
+### 9.8 Sample Output
+
+**Simple Console Logger output**:
+
+```
+🚀 [asset_research_orchestrator] Started: Analyze asset ESN-12345: Find all LLPs...
+📋 [asset_research_orchestrator] Created plan with 4 steps
+  📤 [asset_research_orchestrator] → Delegating to [asset_extractor_agent]: Get asset overview...
+    🚀 [asset_extractor_agent] Started: Get asset overview...
+    🔧 [asset_extractor_agent] Calling tool: asset_metadata_tool({"asset_id": "ESN-12345"})
+    ✓ [asset_extractor_agent] Tool completed: asset_metadata_tool (234ms)
+    🤔 [asset_extractor_agent] Thinking: Found 4,523 pages across 156 documents...
+    🔧 [asset_extractor_agent] Calling tool: asset_rag_search_tool({"query": "life limited parts"})
+    ✓ [asset_extractor_agent] Tool completed: asset_rag_search_tool (567ms)
+    📌 [asset_extractor_agent] Canvas entry added: "LLP List from Logbook"
+    🎯 [asset_extractor_agent] ✓ Final answer generated
+  📥 [asset_extractor_agent] → [asset_research_orchestrator]: Found 23 LLPs across 3 documents...
+  📤 [asset_research_orchestrator] → Delegating to [regulatory_researcher_agent]: Validate AD compliance...
+    🚀 [regulatory_researcher_agent] Started: Validate AD compliance...
+    🔧 [regulatory_researcher_agent] Calling tool: deep_researcher_tool({"query": "AD 2021-15-12 CFM56"})
+    ...
+✅ [asset_research_orchestrator] Completed successfully
+```
+
+### 9.9 Configuration
+
+**Add to**: `configs/config_asset_research.py`
+
+```python
+# ============================================================================
+# OBSERVABILITY CONFIGURATION
+# ============================================================================
+
+observability_config = dict(
+    # Console output
+    live_monitor=False,  # Use rich live display (fancy)
+    verbose=True,  # Show all events vs just major ones
+    
+    # Event history
+    max_history=1000,
+    
+    # External integrations
+    langfuse_enabled=False,  # Set True + env vars to enable
+    langsmith_enabled=False,
+    
+    # What to log
+    log_thinking=True,  # Show agent reasoning
+    log_tool_args=True,  # Show tool arguments
+    log_tool_results=False,  # Show full tool results (verbose!)
+)
+```
+
+### 9.10 Updated TODOs
+
+```yaml
+  - id: event-types
+    content: Define all observable event types and AgentEvent dataclass
+    status: pending
+  - id: event-emitter
+    content: Implement EventEmitter singleton with subscribe/emit pattern
+    status: pending
+  - id: console-monitor
+    content: Create ConsoleLiveMonitor and SimpleConsoleLogger for real-time display
+    status: pending
+  - id: observable-mixin
+    content: Create ObservableMixin for easy agent instrumentation
+    status: pending
+  - id: langfuse-integration
+    content: Add Langfuse handler for external observability (optional)
+    status: pending
+  - id: integrate-observability
+    content: Integrate ObservableMixin into all agents and entry points
+    status: pending
+```
+
+### 9.11 New Files Summary
+
+| File | Description |
+|------|-------------|
+| `src/observability/__init__.py` | Package init |
+| `src/observability/events.py` | Event types and AgentEvent dataclass |
+| `src/observability/emitter.py` | EventEmitter singleton |
+| `src/observability/console_monitor.py` | Console display (Live + Simple) |
+| `src/agent/mixins/observable_mixin.py` | Agent mixin for emitting events |
+| `src/observability/integrations/langfuse_handler.py` | Langfuse integration |
+| `src/observability/integrations/langsmith_handler.py` | LangSmith integration (optional) |
+
 ## Summary: What Makes This a "Smart Agent"
 
 1. **Intelligent Routing**: Automatically selects the best agent for each sub-task based on content analysis
@@ -2848,4 +3751,6 @@ Add these to the plan header:
 9. **Token-Aware Processing**: Never exceeds LLM context limits, gracefully degrades with summarization/truncation
 
 10. **Canvas Working Memory**: Stores findings with tags for selective retrieval, minimizing token usage while maintaining full knowledge base
+
+11. **Full Observability**: Real-time visibility into agent activity - see which agent is doing what, tool calls, thinking, plan changes, and delegation chains with human-readable event streams
 
