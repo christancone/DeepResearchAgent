@@ -22,7 +22,8 @@ import PIL
 import PIL.Image
 import requests
 
-from src.utils import _is_package_available
+# Use relative import to avoid circular dependency during src.utils initialization
+from .utils import _is_package_available
 
 class AgentType:
     """

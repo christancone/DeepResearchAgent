@@ -1,5 +1,24 @@
+# Import Singleton and path_utils first (required by src.config.cfg)
+# to avoid circular import when token_counter imports from src.config
+from .singleton import Singleton
 from .path_utils import assemble_project_path
+
+# Now safe to import token utilities (which may trigger src.config imports)
 from .token_utils import get_token_count
+from .token_counter import (
+    TokenCounter,
+    count_tokens,
+    count_messages_tokens,
+    check_context_fit,
+)
+from .context_budget import (
+    ContextBudgetManager,
+    BudgetAllocation,
+    ContentBlock,
+    TruncationStrategy,
+    ContextOverflowError,
+    create_summarizer,
+)
 from .image_utils import download_image
 from .utils import (escape_code_brackets,
                              _is_package_available,
@@ -16,7 +35,6 @@ from .utils import (escape_code_brackets,
                              parse_code_blobs,
                              extract_code_from_text
                              )
-from .singleton import Singleton
 from .function_utils import (_convert_type_hints_to_json_schema,
                             get_imports,
                             get_json_schema)
@@ -31,6 +49,16 @@ from .url_utils import fetch_url
 __all__ = [
     "assemble_project_path",
     "get_token_count",
+    "TokenCounter",
+    "count_tokens",
+    "count_messages_tokens",
+    "check_context_fit",
+    "ContextBudgetManager",
+    "BudgetAllocation",
+    "ContentBlock",
+    "TruncationStrategy",
+    "ContextOverflowError",
+    "create_summarizer",
     "download_image",
     "escape_code_brackets",
     "_is_package_available",

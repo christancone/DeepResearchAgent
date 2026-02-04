@@ -1,5 +1,15 @@
 from typing import Optional
-from markitdown._base_converter import DocumentConverterResult
+from dataclasses import dataclass
+
+# Try to import DocumentConverterResult from markitdown, fallback to local dataclass
+try:
+    from markitdown._base_converter import DocumentConverterResult
+except ImportError:
+    @dataclass
+    class DocumentConverterResult:
+        """Fallback dataclass when markitdown is not available."""
+        markdown: str = ""
+        title: str = ""
 
 from src.tools import AsyncTool
 from src.utils import fetch_url

@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  asset-research-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: asset-research-agent-dev
+    environment:
+      # Load from .env file
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - DATABASE_URL=${DATABASE_URL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=${OPENAI_API_BASE:-https://api.openai.com/v1}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_API_BASE=${ANTHROPIC_API_BASE:-https://api.anthropic.com}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GOOGLE_API_BASE=${GOOGLE_API_BASE:-https://generativelanguage.googleapis.com}
+      - HUGGINEFACE_API_KEY=${HUGGINEFACE_API_KEY}
+      - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY}
+      # Python settings
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - PYTHONWARNINGS=ignore
+      - ANONYMIZED_TELEMETRY=false
+    volumes:
+      # Mount outputs directory to persist results
+      - ./outputs:/app/outputs
+      # Mount configs if you want to edit them without rebuilding
+      - ./configs:/app/configs:ro
+      # Mount source code for live development (no rebuild needed for code changes)
+      - ./src:/app/src
+      - ./examples:/app/examples
+      - ./main.py:/app/main.py
+    # Keep container running for interactive use
+    stdin_open: true
+    tty: true
+    # Override command to keep container running
+    command: tail -f /dev/null

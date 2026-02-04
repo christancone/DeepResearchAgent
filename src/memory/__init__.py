@@ -9,6 +9,10 @@ from src.memory.memory import (
     FinalAnswerStep,
     ToolCall
 )
+from src.memory.canvas import (
+    WorkingMemoryCanvas,
+    CanvasEntry,
+)
 
 __all__ = [
     "AgentMemory",
@@ -19,5 +23,7 @@ __all__ = [
     "SystemPromptStep",
     "UserPromptStep",
     "FinalAnswerStep",
-    "ToolCall"
+    "ToolCall",
+    "WorkingMemoryCanvas",
+    "CanvasEntry",
 ]
