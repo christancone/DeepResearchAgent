@@ -27,6 +27,8 @@ services:
     volumes:
       # Mount outputs directory to persist results
       - ./outputs:/app/outputs
+      # Mount workdir to persist run artifacts
+      - ./workdir:/app/workdir
       # Mount configs if you want to edit them without rebuilding
       - ./configs:/app/configs:ro
     # Keep container running for interactive use

@@ -32,6 +32,7 @@ google-search-results = ">=2.4.2"
 # datasets = ">=3.5.0"  # Commented - causes resolution issues, not needed for core functionality
 anthropic = ">=0.49.0"
 openpyxl = ">=3.1.5"
+xlsxwriter = ">=3.2.4"  # 3.2.3 is yanked
 baidusearch = ">=1.0.3"
 patchright = ">=1.51.3"
 pyautogui = ">=0.9.54"

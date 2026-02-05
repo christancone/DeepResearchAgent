@@ -41,16 +41,16 @@ COPY pyproject.toml poetry.lock requirements.txt Makefile README.md ./
 # 4. Install playwright and chromium browser
 # 5. Poetry install (--no-root to skip installing current project, we just need deps)
 # 6. Install xlrd==2.0.1
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir poetry && \
-    pip install --no-cache-dir 'markitdown[all]' && \
-    pip install --no-cache-dir "browser-use[memory]==0.1.48" && \
-    pip install --no-cache-dir playwright && \
-    playwright install chromium --with-deps && \
-    poetry config virtualenvs.create false && \
-    poetry lock && \
-    poetry install --no-interaction --no-ansi --no-root && \
-    pip install --no-cache-dir xlrd==2.0.1
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir poetry
+RUN pip install --no-cache-dir "markitdown[all]"
+RUN pip install --no-cache-dir "browser-use[memory]==0.1.48"
+RUN pip install --no-cache-dir playwright
+RUN playwright install chromium --with-deps --no-shell
+RUN poetry config virtualenvs.create false
+RUN poetry lock --no-update || poetry lock
+RUN poetry install --no-interaction --no-ansi --no-root
+RUN pip install --no-cache-dir xlrd==2.0.1
 
 # Copy the entire project
 COPY . .
