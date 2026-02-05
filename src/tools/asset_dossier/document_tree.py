@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 from src.tools import AsyncTool, ToolResult
 from src.registry import TOOL
 from src.tools.asset_dossier.db_client import SupabaseAsyncClient
+from src.tools.asset_dossier.utils import normalize_asset_id
 
 
 _DOCUMENT_TREE_DESCRIPTION = """Navigate and filter the document tree for an asset.
@@ -35,31 +36,37 @@ class DocumentTreeTool(AsyncTool):
             },
             "path_filter": {
                 "type": "string",
-                "description": "Filter by path pattern (supports * wildcard)"
+                "description": "Filter by path pattern (supports * wildcard)",
+                "nullable": True
             },
             "doc_type_filter": {
                 "type": "string",
                 "enum": ["logbook", "work_order", "service_bulletin", "ad_compliance", 
                         "teardown", "borescope", "invoice", "certificate", "other"],
-                "description": "Filter by document type"
+                "description": "Filter by document type",
+                "nullable": True
             },
             "name_contains": {
                 "type": "string",
-                "description": "Filter documents containing this text in name"
+                "description": "Filter documents containing this text in name",
+                "nullable": True
             },
             "status_filter": {
                 "type": "string",
                 "enum": ["completed", "processing", "failed", "pending"],
-                "description": "Filter by processing status"
+                "description": "Filter by processing status",
+                "nullable": True
             },
             "include_page_ids": {
                 "type": "boolean",
                 "description": "Include list of page IDs for each document",
+                "nullable": True,
                 "default": False
             },
             "limit": {
                 "type": "integer",
                 "description": "Maximum documents to return",
+                "nullable": True,
                 "default": 50
             }
         },
@@ -91,6 +98,7 @@ class DocumentTreeTool(AsyncTool):
     ) -> ToolResult:
         """Navigate and filter document tree."""
         try:
+            asset_id = normalize_asset_id(asset_id)
             db = await SupabaseAsyncClient.get_instance()
             
             # Build query with filters
@@ -175,7 +183,7 @@ class DocumentTreeTool(AsyncTool):
                     pages = await db.fetch("""
                         SELECT id, page_index
                         FROM document_pages
-                        WHERE document_processing_record_id = $1
+                        WHERE document_id = $1
                         ORDER BY page_index
                     """, doc["document_id"])
                     

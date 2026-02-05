@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 from src.tools import AsyncTool, ToolResult
 from src.registry import TOOL
 from src.tools.asset_dossier.db_client import SupabaseAsyncClient
+from src.tools.asset_dossier.utils import normalize_asset_id
 
 
 _ASSET_BATCH_SUMMARY_DESCRIPTION = """Retrieve existing aggregation batches (pre-computed summaries).
@@ -26,6 +27,7 @@ class AssetBatchSummaryTool(AsyncTool):
             "tier": {
                 "type": "integer",
                 "description": "Aggregation tier (2 or 3)",
+                "nullable": True,
                 "default": 2
             }
         },
@@ -40,6 +42,7 @@ class AssetBatchSummaryTool(AsyncTool):
     ) -> ToolResult:
         """Retrieve aggregation batches."""
         try:
+            asset_id = normalize_asset_id(asset_id)
             db = await SupabaseAsyncClient.get_instance()
             
             # Query aggregation batches

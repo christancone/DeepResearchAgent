@@ -13,6 +13,7 @@ Usage:
 import asyncio
 import argparse
 import json
+import re
 import os
 import sys
 from datetime import datetime
@@ -27,6 +28,7 @@ from src.models import model_manager
 from src.agent import create_agent
 from src.agent.reformulator import prepare_response
 from src.memory.canvas import WorkingMemoryCanvas
+from src.memory import FinalAnswerStep
 from src.tools.canvas_tool import CanvasTool
 from src.schemas.asset_research_output import AssetResearchOutput, ResearchMetadata
 from src.observability.emitter import EventEmitter
@@ -101,6 +103,15 @@ Examples:
     return parser.parse_args()
 
 
+def _sanitize_json_text(text: str) -> str:
+    """Fix common formatting glitches in model JSON output."""
+    cleaned = re.sub(r":\s*\|\s*\{", ": [{", text)
+    cleaned = re.sub(r":\s*\|\s*\[", ": [", cleaned)
+    cleaned = re.sub(r":\s*\|\s*\]", ": []", cleaned)
+    cleaned = re.sub(r"\|\s*(\{|\[|\])", r"\1", cleaned)
+    return cleaned
+
+
 async def get_asset_context(asset_id: str) -> dict:
     """
     Fetch asset metadata for context injection.
@@ -119,12 +130,12 @@ async def get_asset_context(asset_id: str) -> dict:
         
         # Get asset overview
         asset = await db.fetchrow("""
-            SELECT a.id, a.name, a.status, 
-                   COUNT(DISTINCT dpr.id) as total_documents,
-                   COUNT(DISTINCT dp.id) as total_pages
+            SELECT a.id, a.name, a.status,
+                   COALESCE(a.total_documents, COUNT(DISTINCT dpr.id)) as total_documents,
+                   COALESCE(a.total_pages, COUNT(DISTINCT dp.id)) as total_pages
             FROM assets a
             LEFT JOIN document_processing_records dpr ON dpr.asset_id = a.id
-            LEFT JOIN document_pages dp ON dp.document_processing_record_id = dpr.id
+            LEFT JOIN document_pages dp ON dp.document_id = dpr.id
             WHERE a.id = $1
             GROUP BY a.id
         """, asset_id)
@@ -187,6 +198,19 @@ async def main():
     # 1. Initialize configuration
     print(f"Loading configuration from: {args.config}")
     config.init_config(args.config, args)
+
+    # Fallback to OpenAI if Anthropic key is missing
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        fallback_model_id = "gpt-4.1"
+        for key in [
+            "agent_config",
+            "planning_agent_config",
+            "asset_extractor_agent_config",
+            "deep_analyzer_agent_config",
+        ]:
+            agent_cfg = config.get(key)
+            if isinstance(agent_cfg, dict) and str(agent_cfg.get("model_id", "")).startswith("claude"):
+                agent_cfg["model_id"] = fallback_model_id
     
     # 2. Initialize logger
     logger.init_logger(log_path=config.log_path)
@@ -235,6 +259,14 @@ async def main():
     print(f"Pages: {asset_context.get('total_pages', 'Unknown')}")
     print(f"Documents: {asset_context.get('total_documents', 'Unknown')}")
     print(f"Database connected: {asset_context.get('database_connected', False)}")
+
+    # Inject asset context into config for prompt templates
+    config.asset_id = args.asset_id
+    config.asset_name = asset_context.get("asset_name", "")
+    config.total_pages = asset_context.get("total_pages", 0)
+    config.total_documents = asset_context.get("total_documents", 0)
+    config.document_types = asset_context.get("document_types", [])
+    os.environ["ASSET_ID"] = args.asset_id
     
     # 7. Build the task with context
     task = f"""
@@ -270,15 +302,26 @@ async def main():
     
     # 9. Run the agent
     try:
+        additional_args = {
+            "asset_id": args.asset_id,
+            "asset_name": asset_context.get("asset_name", ""),
+            "total_pages": asset_context.get("total_pages", 0),
+            "total_documents": asset_context.get("total_documents", 0),
+            "document_types": asset_context.get("document_types", []),
+        }
         if args.stream:
             # Streaming mode
             print("Running in streaming mode...\n")
-            async for chunk in agent.run_stream(task):
-                print(chunk, end="", flush=True)
-            result = agent.final_answer
+            final_result = None
+            async for chunk in agent.run_stream(task, additional_args=additional_args):
+                if isinstance(chunk, FinalAnswerStep):
+                    final_result = chunk.output
+                else:
+                    print(chunk, end="", flush=True)
+            result = final_result
         else:
             # Normal mode
-            result = await agent.run(task)
+            result = await agent.run(task, additional_args=additional_args)
         
         # 10. Prepare final response with reformulation
         if config.get("reformulation_model_id"):
@@ -291,6 +334,16 @@ async def main():
             )
         else:
             final_result = result
+
+        if isinstance(final_result, str):
+            try:
+                sanitized = _sanitize_json_text(final_result)
+                parsed = json.loads(sanitized)
+                if isinstance(parsed, str):
+                    parsed = json.loads(_sanitize_json_text(parsed))
+                final_result = parsed
+            except Exception as e:
+                logger.warning(f"Failed to sanitize/parse JSON output: {e}")
         
     except Exception as e:
         logger.error(f"Agent execution failed: {e}")
@@ -300,6 +353,16 @@ async def main():
     # 11. Build output with metadata
     processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
     
+    if isinstance(final_result, str):
+        try:
+            sanitized = _sanitize_json_text(final_result)
+            parsed = json.loads(sanitized)
+            if isinstance(parsed, str):
+                parsed = json.loads(_sanitize_json_text(parsed))
+            final_result = parsed
+        except Exception as e:
+            logger.warning(f"Failed to sanitize/parse JSON output before save: {e}")
+
     output = {
         "research_metadata": {
             "asset_id": args.asset_id,
@@ -319,15 +382,17 @@ async def main():
     }
     
     # 12. Save output
-    output_path = args.output or f"workdir/asset_research_{args.asset_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    run_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    run_dir = Path("workdir") / f"asset_research_{args.asset_id}_{run_stamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    output_path = args.output or str(run_dir / "output.json")
     
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, default=str)
     
     # Save canvas if it has entries
     if canvas.entries:
-        canvas_path = f"workdir/canvas_{args.asset_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        canvas_path = str(run_dir / "canvas.json")
         canvas.save_to_file(canvas_path)
         print(f"Canvas saved to: {canvas_path}")
     
@@ -337,6 +402,7 @@ async def main():
     print(f"{'='*60}\n")
     
     print(f"Output saved to: {output_path}")
+    print(f"Run folder: {run_dir}")
     print(f"Processing time: {processing_time/1000:.1f}s")
     
     # Print execution summary

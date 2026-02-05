@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 from src.tools import AsyncTool, ToolResult
 from src.registry import TOOL
 from src.tools.asset_dossier.db_client import SupabaseAsyncClient
+from src.tools.asset_dossier.utils import normalize_asset_id
 
 
 _ASSET_RAG_SEARCH_DESCRIPTION = """Semantic search on asset documents using pgvector embeddings.
@@ -30,11 +31,13 @@ class AssetRAGSearchTool(AsyncTool):
             "limit": {
                 "type": "integer",
                 "description": "Maximum number of results to return",
+                "nullable": True,
                 "default": 20
             },
             "min_similarity": {
                 "type": "number",
                 "description": "Minimum similarity score (0.0-1.0)",
+                "nullable": True,
                 "default": 0.5
             }
         },
@@ -55,6 +58,7 @@ class AssetRAGSearchTool(AsyncTool):
     ) -> ToolResult:
         """Perform semantic search on asset documents."""
         try:
+            asset_id = normalize_asset_id(asset_id)
             db = await SupabaseAsyncClient.get_instance()
             limit = limit or self.default_limit
             
@@ -81,8 +85,8 @@ class AssetRAGSearchTool(AsyncTool):
                         LIMIT 1
                     )) as similarity
                 FROM document_pages dp
-                JOIN document_processing_records dpr ON dp.document_processing_record_id = dpr.id
-                JOIN document_chunks dc ON dc.document_page_id = dp.id
+                JOIN document_processing_records dpr ON dp.document_id = dpr.id
+                JOIN document_chunks dc ON dc.page_id = dp.id
                 WHERE dpr.asset_id = $2
                 AND dc.text_content ILIKE $3
                 ORDER BY similarity DESC

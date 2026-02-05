@@ -53,51 +53,70 @@ Use this tool to:
             },
             "title": {
                 "type": "string",
-                "description": "Title for the finding (for 'add' action)"
+                "description": "Title for the finding (for 'add' action)",
+                "nullable": True
             },
             "tags": {
                 "type": "array",
-                "description": "Tags for categorization or retrieval"
+                "items": {"type": "string"},
+                "description": "Tags for categorization or retrieval",
+                "nullable": True
             },
             "content": {
                 "type": "string",
-                "description": "Full content of the finding (for 'add' or 'update' action)"
+                "description": "Full content of the finding (for 'add' or 'update' action)",
+                "nullable": True
             },
             "summary": {
                 "type": "string",
-                "description": "Short summary of the finding (for 'add' action, optional)"
+                "description": "Short summary of the finding (for 'add' action, optional)",
+                "nullable": True
             },
             "citations": {
                 "type": "array",
-                "description": "Source citations for the finding [{page_id, document_id, excerpt, confidence}, ...]"
+                "items": {"type": "object"},
+                "description": "Source citations for the finding [{page_id, document_id, excerpt, confidence}, ...]",
+                "nullable": True
             },
             "query": {
                 "type": "string",
-                "description": "Search query (for 'search' action)"
+                "description": "Search query (for 'search' action)",
+                "nullable": True
             },
             "entry_id": {
                 "type": "string",
-                "description": "Entry ID (for 'get_entry', 'update', or 'delete' action)"
+                "description": "Entry ID (for 'get_entry', 'update', or 'delete' action)",
+                "nullable": True
             },
             "limit": {
                 "type": "integer",
-                "description": "Maximum entries to return (default: 10)"
+                "description": "Maximum entries to return (default: 10)",
+                "nullable": True
             },
             "include_full_content": {
                 "type": "boolean",
-                "description": "Include full content or just summaries (default: false)"
+                "description": "Include full content or just summaries (default: false)",
+                "nullable": True
             },
             "confidence": {
                 "type": "string",
-                "description": "Confidence level: high, medium, low (for 'add' action)"
+                "description": "Confidence level: high, medium, low (for 'add' action)",
+                "nullable": True
             },
             "category": {
                 "type": "string",
-                "description": "Category for grouping (for 'add' action)"
+                "description": "Category for grouping (for 'add' action)",
+                "nullable": True
             },
             "match_all_tags": {
                 "type": "boolean",
-                "description": "If true, entry must have ALL specified tags (for 'get_by_tags')"
+                "description": "If true, entry must have ALL specified tags (for 'get_by_tags')",
+                "nullable": True
+            },
+            "agent_name": {
+                "type": "string",
+                "description": "Optional agent name for attribution",
+                "nullable": True
             }
         },
         "required": ["action"]
@@ -157,7 +176,7 @@ Use this tool to:
         confidence: str = "medium",
         category: Optional[str] = None,
         match_all_tags: bool = False,
-        **kwargs
+        agent_name: str = ""
     ) -> ToolResult:
         """
         Execute a canvas action.
@@ -194,7 +213,7 @@ Use this tool to:
                     content=content,
                     summary=summary,
                     citations=citations,
-                    agent=kwargs.get("agent_name", ""),
+                    agent=agent_name,
                     confidence=confidence,
                     category=category
                 )

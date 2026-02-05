@@ -32,11 +32,13 @@ class AssetPageReadTool(AsyncTool):
             "page_ids": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "List of page IDs to read"
+                "description": "List of page IDs to read",
+                "nullable": True
             },
             "document_id": {
                 "type": "string",
-                "description": "Document ID to read pages from (use with page_range)"
+                "description": "Document ID to read pages from (use with page_range)",
+                "nullable": True
             },
             "page_range": {
                 "type": "object",
@@ -44,11 +46,13 @@ class AssetPageReadTool(AsyncTool):
                     "start": {"type": "integer"},
                     "end": {"type": "integer"}
                 },
-                "description": "Page range within document (0-indexed)"
+                "description": "Page range within document (0-indexed)",
+                "nullable": True
             },
             "include_raw_text": {
                 "type": "boolean",
                 "description": "Include raw OCR text in addition to structured data",
+                "nullable": True,
                 "default": True
             }
         },
@@ -86,7 +90,7 @@ class AssetPageReadTool(AsyncTool):
                 page_records = await db.fetch("""
                     SELECT id
                     FROM document_pages
-                    WHERE document_processing_record_id = $1
+                    WHERE document_id = $1
                     AND page_index >= $2
                     AND page_index < $3
                     ORDER BY page_index
@@ -102,21 +106,20 @@ class AssetPageReadTool(AsyncTool):
             
             # Fetch page content
             # Note: We need to handle UUID array properly
-            pages = await db.fetch("""
+                pages = await db.fetch("""
                 SELECT 
                     dp.id as page_id,
                     dp.page_index,
                     dp.extracted_json,
                     dp.enhanced_s3_key,
-                    dp.status,
                     dp.created_at,
                     dpr.id as document_id,
                     dpr.original_path as document_path,
                     dpr.file_name as document_name,
                     dpr.asset_id
                 FROM document_pages dp
-                JOIN document_processing_records dpr ON dp.document_processing_record_id = dpr.id
-                WHERE dp.id = ANY($1::uuid[])
+                JOIN document_processing_records dpr ON dp.document_id = dpr.id
+                WHERE dp.id::text = ANY($1::text[])
                 ORDER BY dpr.original_path, dp.page_index
             """, pages_to_fetch)
             
@@ -130,7 +133,6 @@ class AssetPageReadTool(AsyncTool):
                     "document_name": row["document_name"],
                     "asset_id": str(row["asset_id"]),
                     "page_index": row["page_index"],
-                    "status": row["status"],
                     "enhanced_s3_key": row.get("enhanced_s3_key"),
                     # Citation metadata
                     "citation": {

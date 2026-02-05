@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 from src.tools import AsyncTool, ToolResult
 from src.registry import TOOL
 from src.tools.asset_dossier.db_client import SupabaseAsyncClient
+from src.tools.asset_dossier.utils import normalize_asset_id
 
 
 _ASSET_METADATA_DESCRIPTION = """Retrieve comprehensive asset overview including:
@@ -32,11 +33,13 @@ class AssetMetadataTool(AsyncTool):
             "include_file_tree": {
                 "type": "boolean",
                 "description": "Include the document file tree structure",
+                "nullable": True,
                 "default": True
             },
             "include_summary": {
                 "type": "boolean",
                 "description": "Include existing summary_json if available",
+                "nullable": True,
                 "default": True
             }
         },
@@ -52,6 +55,7 @@ class AssetMetadataTool(AsyncTool):
     ) -> ToolResult:
         """Retrieve asset metadata."""
         try:
+            asset_id = normalize_asset_id(asset_id)
             db = await SupabaseAsyncClient.get_instance()
             
             # Get basic asset info
@@ -64,13 +68,12 @@ class AssetMetadataTool(AsyncTool):
                     a.updated_at,
                     a.summary_json,
                     a.user_id,
-                    COUNT(DISTINCT dpr.id) as total_documents,
-                    COUNT(DISTINCT dp.id) as total_pages,
-                    SUM(CASE WHEN dp.status = 'completed' THEN 1 ELSE 0 END) as processed_pages,
-                    SUM(CASE WHEN dp.status = 'failed' THEN 1 ELSE 0 END) as failed_pages
+                    COALESCE(a.total_documents, COUNT(DISTINCT dpr.id)) as total_documents,
+                    COALESCE(a.total_pages, COUNT(DISTINCT dp.id)) as total_pages,
+                    COALESCE(a.pages_processed, 0) as pages_processed
                 FROM assets a
                 LEFT JOIN document_processing_records dpr ON dpr.asset_id = a.id
-                LEFT JOIN document_pages dp ON dp.document_processing_record_id = dpr.id
+                LEFT JOIN document_pages dp ON dp.document_id = dpr.id
                 WHERE a.id = $1
                 GROUP BY a.id
             """, asset_id)
@@ -89,10 +92,10 @@ class AssetMetadataTool(AsyncTool):
                 "updated_at": asset["updated_at"].isoformat() if asset["updated_at"] else None,
                 "total_documents": asset["total_documents"] or 0,
                 "total_pages": asset["total_pages"] or 0,
-                "processed_pages": asset["processed_pages"] or 0,
-                "failed_pages": asset["failed_pages"] or 0,
+                "processed_pages": asset["pages_processed"] or 0,
+                "failed_pages": 0,
                 "processing_progress": (
-                    round((asset["processed_pages"] or 0) / asset["total_pages"] * 100, 1)
+                    round((asset["pages_processed"] or 0) / asset["total_pages"] * 100, 1)
                     if asset["total_pages"] else 0
                 )
             }

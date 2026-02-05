@@ -295,6 +295,15 @@ class ModelManager(metaclass=Singleton):
                     "model_name": "claude37-sonnet-thinking",
                     "model_id": "claude-3-7-sonnet-20250219",
                 },
+                # Aliases used in configs
+                {
+                    "model_name": "claude-3.7-sonnet",
+                    "model_id": "claude-3-7-sonnet-20250219",
+                },
+                {
+                    "model_name": "claude-3.7-sonnet-thinking",
+                    "model_id": "claude-3-7-sonnet-20250219",
+                },
             ]
             
             for model in models:
