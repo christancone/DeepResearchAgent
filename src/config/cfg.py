@@ -10,6 +10,11 @@ from src.logger import logger
 
 def process_general(config: MMConfig) -> MMConfig:
 
+    # Ensure base workdir exists first
+    workdir_path = assemble_project_path(config.workdir)
+    os.makedirs(workdir_path, exist_ok=True)
+    
+    # Then create the experiment-specific subdirectory
     config.exp_path = assemble_project_path(os.path.join(config.workdir, config.tag))
     os.makedirs(config.exp_path, exist_ok=True)
 

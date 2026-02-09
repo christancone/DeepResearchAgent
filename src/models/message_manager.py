@@ -18,6 +18,18 @@ UNSUPPORTED_TOOL_CHOICE_MODELS = [
     'claude37-sonnet',
 ]
 
+def _sanitize_schema_payload(value):
+    """Recursively sanitize schema payload values for JSON serialization."""
+    if callable(value):
+        return getattr(value, "__name__", "callable")
+    if isinstance(value, dict):
+        return {k: _sanitize_schema_payload(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_schema_payload(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
 class MessageManager():
     def __init__(self, model_id: str, api_type: str = "chat/completions"):
         self.model_id = model_id
@@ -212,7 +224,7 @@ class MessageManager():
                              tool: Any,
                              model_id: Optional[str] = None
                              ) -> Dict:
-        properties = deepcopy(tool.parameters['properties'])
+        properties = _sanitize_schema_payload(deepcopy(tool.parameters['properties']))
 
         required = []
         for key, value in properties.items():

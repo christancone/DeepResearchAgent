@@ -162,9 +162,9 @@ planning_agent_config = dict(
     ],
     managed_agents=[
         "asset_extractor_agent",
-        "regulatory_researcher_agent",
-        "document_analyzer_agent",
-        # "regulatory_scraper_agent"  # Uncomment if browser scraping is needed
+        "deep_researcher_agent",   # registry key; display name "regulatory_researcher_agent" from deep_researcher_agent_config
+        "deep_analyzer_agent",    # registry key; display name "document_analyzer_agent" from deep_analyzer_agent_config
+        # "browser_use_agent"     # Uncomment if browser scraping is needed
     ]
 )
 

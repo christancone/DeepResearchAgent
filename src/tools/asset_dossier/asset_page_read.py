@@ -106,7 +106,7 @@ class AssetPageReadTool(AsyncTool):
             
             # Fetch page content
             # Note: We need to handle UUID array properly
-                pages = await db.fetch("""
+            pages = await db.fetch("""
                 SELECT 
                     dp.id as page_id,
                     dp.page_index,
@@ -122,6 +122,8 @@ class AssetPageReadTool(AsyncTool):
                 WHERE dp.id::text = ANY($1::text[])
                 ORDER BY dpr.original_path, dp.page_index
             """, pages_to_fetch)
+            if pages is None:
+                pages = []
             
             # Format results
             formatted_pages = []

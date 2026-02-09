@@ -42,6 +42,18 @@ IMPORT_TO_PACKAGE_MAPPING = {
     "wikipediaapi": "wikipedia-api",
 }
 
+def _sanitize_schema_value(value: Any) -> Any:
+    """Ensure JSON-schema values are JSON-serializable and callable-safe."""
+    if callable(value):
+        return getattr(value, "__name__", "callable")
+    if isinstance(value, dict):
+        return {k: _sanitize_schema_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_schema_value(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
 
 def get_package_name(import_name: str) -> str:
     """
@@ -225,9 +237,9 @@ def get_json_schema(func: Callable) -> dict:
             desc = enum_choices.string[: enum_choices.start()].strip()
         schema["description"] = desc
 
-    output = {"name": func.__name__, "description": main_doc, "parameters": json_schema}
+    output = {"name": func.__name__, "description": main_doc, "parameters": _sanitize_schema_value(json_schema)}
     if return_dict is not None:
-        output["return"] = return_dict
+        output["return"] = _sanitize_schema_value(return_dict)
     return {"type": "function", "function": output}
 
 
@@ -320,12 +332,16 @@ def _convert_type_hints_to_json_schema(func: Callable, error_on_missing_type_hin
     if required:
         schema["required"] = required
 
-    return schema
+    return _sanitize_schema_value(schema)
 
 
 def _parse_type_hint(hint: str) -> dict:
     origin = get_origin(hint)
     args = get_args(hint)
+
+    # Callable and other non-JSON-serializable types: map to string to avoid schema errors
+    if origin is None and ("Callable" in str(hint) or getattr(hint, "__name__", "") == "Callable"):
+        return {"type": "string"}
 
     if origin is None:
         try:
@@ -407,12 +423,16 @@ _BASE_TYPE_MAPPING = {
     bool: {"type": "boolean"},
     Any: {"type": "any"},
     types.NoneType: {"type": "null"},
+    Callable: {"type": "string"},  # Callable not representable in JSON schema; treat as string to avoid Pydantic CallableSchema error
 }
 
 
 def _get_json_schema_type(param_type: str) -> dict[str, str]:
     if param_type in _BASE_TYPE_MAPPING:
         return copy(_BASE_TYPE_MAPPING[param_type])
+    # Callable and other non-serializable types: avoid Pydantic CallableSchema errors
+    if "Callable" in str(param_type) or getattr(param_type, "__name__", "") == "Callable":
+        return {"type": "string"}
     if str(param_type) == "Image":
         from PIL.Image import Image
 

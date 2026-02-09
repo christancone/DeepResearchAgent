@@ -18,6 +18,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -30,6 +31,7 @@ from src.agent.reformulator import prepare_response
 from src.memory.canvas import WorkingMemoryCanvas
 from src.memory import FinalAnswerStep
 from src.tools.canvas_tool import CanvasTool
+from src.tools.tools import ToolResult
 from src.schemas.asset_research_output import AssetResearchOutput, ResearchMetadata
 from src.observability.emitter import EventEmitter
 from src.observability.console_monitor import SimpleConsoleLogger, print_execution_summary
@@ -110,6 +112,685 @@ def _sanitize_json_text(text: str) -> str:
     cleaned = re.sub(r":\s*\|\s*\]", ": []", cleaned)
     cleaned = re.sub(r"\|\s*(\{|\[|\])", r"\1", cleaned)
     return cleaned
+
+
+def _escape_control_chars_in_json_strings(text: str) -> str:
+    """Escape raw control chars that appear inside JSON quoted strings."""
+    out: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                out.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escape = True
+                continue
+            if ch == '"':
+                out.append(ch)
+                in_string = False
+                continue
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+            out.append(ch)
+            continue
+        else:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+    return "".join(out)
+
+
+def _loads_json_with_repair(raw_text: str):
+    """Load JSON with light repair passes for malformed model output."""
+    sanitized = _sanitize_json_text(raw_text)
+    try:
+        return json.loads(sanitized)
+    except json.JSONDecodeError as e:
+        # Common failure mode in model output: literal newlines in quoted strings.
+        if "Invalid control character" in str(e):
+            repaired = _escape_control_chars_in_json_strings(sanitized)
+            return json.loads(repaired)
+        raise
+
+
+def _unwrap_tool_result(value):
+    """Normalize ToolResult payloads into plain serializable values."""
+    if isinstance(value, ToolResult):
+        if value.error:
+            logger.warning(f"ToolResult contains error: {value.error}")
+        return value.output
+    return value
+
+
+_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+
+# Non-page placeholders that should not be emitted as source citations (drop/quarantine)
+_SOURCE_PLACEHOLDER_PREFIXES = ("canvas_", "existing_", "document_tree_", "asset extraction ")
+_SOURCE_PLACEHOLDER_VALUES = frozenset({"existing_summary", "document_tree_tool_results"})
+
+
+def _collect_page_ids(value: Any, page_ids: set[str]) -> None:
+    """Recursively collect UUID-like page IDs from arbitrary payloads."""
+    if isinstance(value, str):
+        for match in _UUID_RE.findall(value):
+            page_ids.add(match.lower())
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_page_ids(item, page_ids)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _collect_page_ids(item, page_ids)
+
+
+async def _fetch_page_lookup(page_ids: set[str]) -> dict[str, dict[str, Any]]:
+    """Fetch page metadata for citation enrichment."""
+    if not page_ids:
+        return {}
+    try:
+        from src.tools.asset_dossier.db_client import SupabaseAsyncClient
+
+        db = await SupabaseAsyncClient.get_instance()
+        rows = await db.fetch(
+            """
+            SELECT
+                dp.id AS page_id,
+                dp.page_index,
+                dp.enhanced_s3_key,
+                dpr.id AS document_id,
+                dpr.file_name AS document_name
+            FROM document_pages dp
+            JOIN document_processing_records dpr ON dp.document_id = dpr.id
+            WHERE dp.id::text = ANY($1::text[])
+            """,
+            list(page_ids),
+        )
+        return {
+            str(row["page_id"]).lower(): {
+                "pageId": str(row["page_id"]),
+                "pageIndex": row.get("page_index"),
+                "documentId": str(row["document_id"]) if row.get("document_id") else None,
+                "documentName": row.get("document_name"),
+                "enhancedS3Key": row.get("enhanced_s3_key"),
+            }
+            for row in rows
+        }
+    except Exception as e:
+        logger.warning(f"Could not enrich citations from DB: {e}")
+        return {}
+
+
+def _build_doc_page_index(page_lookup: dict[str, dict[str, Any]]) -> dict[tuple[str, int], str]:
+    """Build (document_id, page_index) -> page_id lookup."""
+    index: dict[tuple[str, int], str] = {}
+    for row in page_lookup.values():
+        document_id = row.get("documentId")
+        page_index = row.get("pageIndex")
+        page_id = row.get("pageId")
+        if isinstance(document_id, str) and isinstance(page_index, int) and isinstance(page_id, str):
+            index[(document_id.lower(), page_index)] = page_id.lower()
+    return index
+
+
+def _normalize_source_pages(
+    source_value: Any,
+    page_lookup: dict[str, dict[str, Any]],
+    doc_page_index: dict[tuple[str, int], str] | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize citations to structured source page objects with enhancedS3Key."""
+    if source_value is None:
+        return []
+
+    items = source_value if isinstance(source_value, list) else [source_value]
+    normalized: list[dict[str, Any]] = []
+
+    for item in items:
+        if isinstance(item, dict):
+            page_id = (
+                item.get("pageId")
+                or item.get("page_id")
+                or item.get("id")
+            )
+            if isinstance(page_id, str):
+                key = page_id.lower()
+                enriched = page_lookup.get(key, {})
+                normalized.append(
+                    {
+                        "pageId": page_id,
+                        "pageIndex": item.get("pageIndex", item.get("page_index", enriched.get("pageIndex"))),
+                        "documentId": item.get("documentId", item.get("document_id", enriched.get("documentId"))),
+                        "documentName": item.get("documentName", item.get("document_name", enriched.get("documentName"))),
+                        "enhancedS3Key": item.get("enhancedS3Key", item.get("enhanced_s3_key", enriched.get("enhancedS3Key"))),
+                    }
+                )
+            continue
+
+        if isinstance(item, str):
+            raw = item.strip()
+            # Handle "uuid|index" patterns where left side can be document_id.
+            if "|" in raw:
+                left, right = raw.split("|", 1)
+                left_match = _UUID_RE.search(left)
+                if left_match:
+                    left_uuid = left_match.group(0).lower()
+                    if left_uuid in page_lookup:
+                        enriched = page_lookup.get(left_uuid, {})
+                        normalized.append(
+                            {
+                                "pageId": enriched.get("pageId"),
+                                "pageIndex": enriched.get("pageIndex"),
+                                "documentId": enriched.get("documentId"),
+                                "documentName": enriched.get("documentName"),
+                                "enhancedS3Key": enriched.get("enhancedS3Key"),
+                            }
+                        )
+                        continue
+
+                    # document_id|page_index form
+                    page_index_match = re.search(r"\d+", right)
+                    if page_index_match and doc_page_index:
+                        page_index = int(page_index_match.group(0))
+                        page_key = doc_page_index.get((left_uuid, page_index))
+                        if page_key and page_key in page_lookup:
+                            enriched = page_lookup[page_key]
+                            normalized.append(
+                                {
+                                    "pageId": enriched.get("pageId"),
+                                    "pageIndex": enriched.get("pageIndex"),
+                                    "documentId": enriched.get("documentId"),
+                                    "documentName": enriched.get("documentName"),
+                                    "enhancedS3Key": enriched.get("enhancedS3Key"),
+                                }
+                            )
+                            continue
+                    logger.warning(
+                        f"Unresolved citation reference '{raw}' (document_id|page_index did not resolve to page_id)"
+                    )
+                    normalized.append(
+                        {
+                            "pageId": None,
+                            "pageIndex": None,
+                            "documentId": left_uuid,
+                            "documentName": raw,
+                            "enhancedS3Key": None,
+                            "unresolvedReference": raw,
+                        }
+                    )
+                    continue
+
+            match = _UUID_RE.search(raw)
+            if match:
+                uuid_value = match.group(0).lower()
+                enriched = page_lookup.get(uuid_value, {})
+                normalized.append(
+                    {
+                        "pageId": enriched.get("pageId", match.group(0)),
+                        "pageIndex": enriched.get("pageIndex"),
+                        "documentId": enriched.get("documentId"),
+                        "documentName": enriched.get("documentName"),
+                        "enhancedS3Key": enriched.get("enhancedS3Key"),
+                    }
+                )
+            else:
+                # Drop known non-page placeholders so they do not become empty citation objects
+                raw_lower = raw.lower()
+                if raw_lower in _SOURCE_PLACEHOLDER_VALUES or any(
+                    raw_lower.startswith(p) for p in _SOURCE_PLACEHOLDER_PREFIXES
+                ):
+                    logger.warning(f"Quarantining non-page placeholder source reference: {raw}")
+                    normalized.append(
+                        {
+                            "pageId": None,
+                            "documentName": str(item),
+                            "enhancedS3Key": None,
+                            "unresolvedReference": str(item),
+                        }
+                    )
+                    continue
+                # Keep other non-UUID textual references as minimal citation (e.g. document names)
+                normalized.append(
+                    {
+                        "pageId": None,
+                        "documentName": str(item),
+                        "enhancedS3Key": None,
+                        "unresolvedReference": str(item),
+                    }
+                )
+
+    return normalized
+
+
+def _extract_source_candidates(value: Any) -> list[Any]:
+    """Extract raw source reference candidates from mixed payload structures."""
+    if value is None:
+        return []
+    candidates: list[Any] = []
+    if isinstance(value, dict):
+        source_keys = (
+            "source_pages",
+            "sourcePages",
+            "source_page_ids",
+            "sourcePageIds",
+            "page_ids",
+            "pageIds",
+            "citations",
+            "sources",
+            "pages",
+        )
+        for key in source_keys:
+            if key in value and value[key] is not None:
+                candidates.append(value[key])
+        for nested in value.values():
+            if isinstance(nested, (dict, list)):
+                candidates.extend(_extract_source_candidates(nested))
+    elif isinstance(value, list):
+        for item in value:
+            candidates.extend(_extract_source_candidates(item))
+    return candidates
+
+
+def _normalize_with_fallback(
+    primary_source: Any,
+    page_lookup: dict[str, dict[str, Any]],
+    doc_page_index: dict[tuple[str, int], str] | None = None,
+    fallback_sources: list[Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize source pages and deterministically fallback to section-level sources when empty."""
+    normalized = _normalize_source_pages(primary_source, page_lookup, doc_page_index)
+    if normalized:
+        return normalized
+    for fallback in fallback_sources or []:
+        normalized = _normalize_source_pages(fallback, page_lookup, doc_page_index)
+        if normalized:
+            return normalized
+    return []
+
+
+def _canonicalize_output(
+    payload: dict[str, Any],
+    args,
+    asset_context: dict[str, Any],
+    page_lookup: dict[str, dict[str, Any]],
+    research_metadata: dict[str, Any],
+    canvas_stats: dict[str, Any],
+) -> dict[str, Any]:
+    """Force a single canonical output shape regardless of model's key style."""
+    asset_id = payload.get("asset_id") or payload.get("assetId") or args.asset_id
+    asset_name = payload.get("asset_name") or payload.get("assetName") or asset_context.get("asset_name", f"Asset {asset_id}")
+    summary_payload = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    analysis_payload = payload.get("analysis") if isinstance(payload.get("analysis"), dict) else {}
+
+    doc_page_index = _build_doc_page_index(page_lookup)
+    findings_fallback_sources = _extract_source_candidates(
+        payload.get("extracted_facts")
+        or payload.get("extractedFacts")
+        or payload.get("extracted_data")
+        or summary_payload.get("component_findings")
+        or summary_payload.get("extracted_data")
+        or payload.get("dossier_overview")
+        or summary_payload.get("dossier_structure")
+    )
+    gaps_fallback_sources = _extract_source_candidates(
+        payload.get("gaps_and_risks")
+        or payload.get("gapsAndRisks")
+        or payload.get("cross_component_gaps")
+        or summary_payload.get("cross_component_gaps")
+        or analysis_payload.get("gaps")
+        or payload.get("identified_gaps")
+    )
+    regulatory_fallback_sources = _extract_source_candidates(
+        payload.get("regulatory_validation")
+        or payload.get("validated_regulatory_references")
+    )
+
+    findings_in = (
+        payload.get("key_findings")
+        or payload.get("keyFindings")
+        or payload.get("findings")
+        or payload.get("extracted_facts")
+        or payload.get("extracted_data")
+        or payload.get("component_findings")
+        or summary_payload.get("key_findings")
+        or summary_payload.get("findings")
+        or summary_payload.get("component_findings")
+        or summary_payload.get("extracted_data")
+        or []
+    )
+    gaps_in = (
+        payload.get("gaps")
+        or payload.get("gapsAndLimitations")
+        or payload.get("gaps_and_ambiguities")
+        or payload.get("identified_gaps")
+        or payload.get("gaps_and_risks")
+        or payload.get("gapsAndRisks")
+        or payload.get("cross_component_gaps")
+        or summary_payload.get("cross_component_gaps")
+        or analysis_payload.get("gaps")
+        or []
+    )
+    gap_analysis_in = payload.get("gap_analysis") or payload.get("gapAnalysis") or []
+    contradictions_in = (
+        payload.get("contradictions")
+        or payload.get("contradictions_found")
+        or summary_payload.get("contradictions")
+        or analysis_payload.get("contradictions")
+        or []
+    )
+    regulatory_in = (
+        payload.get("regulatory_validation")
+        or payload.get("validated_regulatory_references")
+        or summary_payload.get("regulatory_validation")
+        or summary_payload.get("regulatory_validation_gaps")
+        or []
+    )
+
+    components = payload.get("components", [])
+    if not isinstance(components, list):
+        components = []
+
+    # Derive components + findings from "findings" shape when present.
+    key_findings = []
+    derived_component_names: set[str] = set()
+    for f in findings_in if isinstance(findings_in, list) else []:
+        if isinstance(f, str):
+            key_findings.append(
+                {
+                    "title": "finding",
+                    "content": f,
+                    "source_pages": [],
+                    "confidence": "medium",
+                    "validation_status": "unverified",
+                }
+            )
+            continue
+        if isinstance(f, dict):
+            component_name = f.get("component")
+            facts = f.get("facts")
+            if isinstance(component_name, str) and component_name and component_name not in derived_component_names:
+                derived_component_names.add(component_name)
+                component_id = re.sub(r"[^a-z0-9]+", "-", component_name.lower()).strip("-")
+                components.append({"id": component_id or component_name.lower(), "name": component_name})
+
+            if isinstance(facts, list):
+                for fact in facts:
+                    if not isinstance(fact, dict):
+                        continue
+                    key_findings.append(
+                        {
+                            "title": component_name or "finding",
+                            "content": fact.get("description") or fact.get("content") or fact.get("text") or fact.get("value") or "",
+                            "source_pages": _normalize_with_fallback(
+                                fact.get("source_pages", fact.get("sourcePages")),
+                                page_lookup,
+                                doc_page_index,
+                                findings_fallback_sources,
+                            ),
+                            "confidence": fact.get("confidence", "medium"),
+                            "validation_status": fact.get("validation_status", fact.get("validationStatus", "unverified")),
+                        }
+                    )
+                for gap in f.get("gaps", []) if isinstance(f.get("gaps"), list) else []:
+                    if isinstance(gap, str):
+                        gaps_in = list(gaps_in) + [f"{component_name}: {gap}" if component_name else gap]
+                continue
+
+            key_findings.append(
+                {
+                    "title": f.get("title") or f.get("name") or "finding",
+                    "content": f.get("content") or f.get("value") or f.get("description") or f.get("text") or "",
+                    "source_pages": _normalize_with_fallback(
+                        f.get("source_pages", f.get("sourcePages")),
+                        page_lookup,
+                        doc_page_index,
+                        findings_fallback_sources,
+                    ),
+                    "confidence": f.get("confidence", "medium"),
+                    "validation_status": f.get("validation_status", f.get("validationStatus", "unverified")),
+                }
+            )
+
+    gaps = []
+    for g in gaps_in if isinstance(gaps_in, list) else []:
+        if isinstance(g, dict):
+            gaps.append(
+                {
+                    "title": g.get("title") or g.get("gap_type") or "gap",
+                    "description": g.get("description") or g.get("details") or "",
+                    "source_pages": _normalize_with_fallback(
+                        g.get("source_pages", g.get("sourcePages", g.get("related_pages"))),
+                        page_lookup,
+                        doc_page_index,
+                        gaps_fallback_sources,
+                    ),
+                    "confidence": g.get("confidence", "medium"),
+                }
+            )
+        elif isinstance(g, str):
+            gaps.append({"title": "gap", "description": g, "source_pages": [], "confidence": "medium"})
+    for g in gap_analysis_in if isinstance(gap_analysis_in, list) else []:
+        if isinstance(g, str):
+            gaps.append({"title": "gap_analysis", "description": g, "source_pages": [], "confidence": "medium"})
+
+    contradictions = []
+    for c in contradictions_in if isinstance(contradictions_in, list) else []:
+        if isinstance(c, dict):
+            contradictions.append(
+                {
+                    "description": c.get("description") or c.get("content") or "",
+                    "source_pages": _normalize_with_fallback(
+                        c.get("source_pages", c.get("sourcePages", c.get("related_pages", c.get("sources")))),
+                        page_lookup,
+                        doc_page_index,
+                        findings_fallback_sources + gaps_fallback_sources,
+                    ),
+                    "confidence": c.get("confidence", "medium"),
+                }
+            )
+        elif isinstance(c, str):
+            contradictions.append({"description": c, "source_pages": [], "confidence": "medium"})
+
+    regulatory_validation = []
+    for r in regulatory_in if isinstance(regulatory_in, list) else []:
+        if isinstance(r, dict):
+            regulatory_validation.append(
+                {
+                    "reference": r.get("reference") or r.get("title") or ("regulatory_observation" if r.get("description") else "unknown"),
+                    "status": r.get("status") or r.get("validation_status") or "unknown",
+                    "notes": r.get("notes") or r.get("validation_notes") or r.get("content") or r.get("description"),
+                    "source_pages": _normalize_with_fallback(
+                        r.get("source_pages", r.get("sourcePages")),
+                        page_lookup,
+                        doc_page_index,
+                        regulatory_fallback_sources,
+                    ),
+                    "confidence": r.get("confidence", "medium"),
+                }
+            )
+
+    # Deterministic fallback: if canonical lists are empty but raw has extractable content, backfill
+    raw_facts = (
+        payload.get("extracted_facts")
+        or payload.get("extractedFacts")
+        or payload.get("extracted_data")
+        or summary_payload.get("component_findings")
+        or summary_payload.get("extracted_data")
+        or []
+    )
+    raw_gaps = (
+        payload.get("gaps_and_risks")
+        or payload.get("gapsAndRisks")
+        or payload.get("gaps_and_ambiguities")
+        or payload.get("cross_component_gaps")
+        or summary_payload.get("cross_component_gaps")
+        or analysis_payload.get("gaps")
+        or []
+    )
+    regulatory_summary = payload.get("regulatory_validation_summary")
+    if not regulatory_validation and isinstance(regulatory_summary, dict):
+        sb_items = regulatory_summary.get("service_bulletins") or []
+        ad_items = regulatory_summary.get("ads") or []
+        merged: list[dict[str, Any]] = []
+        for item in sb_items if isinstance(sb_items, list) else []:
+            if isinstance(item, dict):
+                merged.append(
+                    {
+                        "reference": item.get("code") or item.get("reference") or "service_bulletin",
+                        "status": item.get("status") or regulatory_summary.get("validation_status") or "unknown",
+                        "notes": item.get("validation_detail") or item.get("notes"),
+                        "source_pages": item.get("source_pages") or item.get("sourcePages") or [],
+                        "confidence": item.get("confidence", "medium"),
+                    }
+                )
+        for item in ad_items if isinstance(ad_items, list) else []:
+            if isinstance(item, dict):
+                merged.append(
+                    {
+                        "reference": item.get("code") or item.get("reference") or "airworthiness_directive",
+                        "status": item.get("status") or regulatory_summary.get("validation_status") or "unknown",
+                        "notes": item.get("validation_detail") or item.get("notes"),
+                        "source_pages": item.get("source_pages") or item.get("sourcePages") or [],
+                        "confidence": item.get("confidence", "medium"),
+                    }
+                )
+            elif isinstance(item, str):
+                merged.append(
+                    {
+                        "reference": item,
+                        "status": regulatory_summary.get("validation_status", "unknown"),
+                        "notes": regulatory_summary.get("validation_notes"),
+                        "source_pages": [],
+                        "confidence": "medium",
+                    }
+                )
+        if merged:
+            for r in merged:
+                regulatory_validation.append(
+                    {
+                        "reference": r.get("reference") or "regulatory_observation",
+                        "status": r.get("status") or "unknown",
+                        "notes": r.get("notes"),
+                        "source_pages": _normalize_with_fallback(
+                            r.get("source_pages", r.get("sourcePages")),
+                            page_lookup,
+                            doc_page_index,
+                            regulatory_fallback_sources,
+                        ),
+                        "confidence": r.get("confidence", "medium"),
+                    }
+                )
+        elif regulatory_summary.get("validation_notes"):
+            regulatory_validation = [
+                {
+                    "reference": "regulatory_validation_summary",
+                    "status": regulatory_summary.get("validation_status", "unknown"),
+                    "notes": regulatory_summary.get("validation_notes"),
+                    "source_pages": [],
+                    "confidence": "medium",
+                }
+            ]
+    if not key_findings and isinstance(raw_facts, list) and raw_facts:
+        logger.warning("key_findings empty but raw extracted_facts present; backfilling from extracted_facts")
+        for f in raw_facts:
+            if isinstance(f, dict):
+                key_findings.append(
+                    {
+                        "title": "finding",
+                        "content": f.get("description") or f.get("content") or f.get("text") or f.get("value") or "",
+                        "source_pages": _normalize_with_fallback(
+                            f.get("source_pages", f.get("sourcePages")),
+                            page_lookup,
+                            doc_page_index,
+                            findings_fallback_sources,
+                        ),
+                        "confidence": f.get("confidence", "medium"),
+                        "validation_status": f.get("validation_status", f.get("validationStatus", "unverified")),
+                    }
+                )
+            elif isinstance(f, str):
+                key_findings.append(
+                    {"title": "finding", "content": f, "source_pages": [], "confidence": "medium", "validation_status": "unverified"}
+                )
+    if not key_findings and isinstance(components, list) and components:
+        logger.warning("key_findings empty but components[].findings present; backfilling from components")
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+            component_name = component.get("name") or component.get("component") or "component"
+            component_findings = component.get("findings")
+            for fact in component_findings if isinstance(component_findings, list) else []:
+                if not isinstance(fact, dict):
+                    continue
+                key_findings.append(
+                    {
+                        "title": component_name,
+                        "content": fact.get("description") or fact.get("content") or fact.get("text") or "",
+                        "source_pages": _normalize_with_fallback(
+                            fact.get("source_pages", fact.get("sourcePages")),
+                            page_lookup,
+                            doc_page_index,
+                            findings_fallback_sources,
+                        ),
+                        "confidence": fact.get("confidence", "medium"),
+                        "validation_status": fact.get("validation_status", fact.get("validationStatus", "unverified")),
+                    }
+                )
+    if not gaps and isinstance(raw_gaps, list) and raw_gaps:
+        logger.warning("gaps empty but raw gaps_and_risks present; backfilling from gaps_and_risks")
+        for g in raw_gaps:
+            if isinstance(g, dict):
+                gaps.append(
+                    {
+                        "title": g.get("title") or g.get("gap_type") or "gap",
+                        "description": g.get("description") or g.get("details") or "",
+                        "source_pages": _normalize_with_fallback(
+                            g.get("source_pages", g.get("sourcePages")),
+                            page_lookup,
+                            doc_page_index,
+                            gaps_fallback_sources,
+                        ),
+                        "confidence": g.get("confidence", "medium"),
+                    }
+                )
+            elif isinstance(g, str):
+                gaps.append({"title": "gap", "description": g, "source_pages": [], "confidence": "medium"})
+
+    return {
+        "asset_id": asset_id,
+        "asset_name": asset_name,
+        "metadata": {
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+            "total_components": len(components),
+            "total_helicopters": payload.get("total_helicopters"),
+            "total_aircraft": payload.get("total_aircraft"),
+            "source_pages_count": asset_context.get("total_pages", 0),
+            "components_by_helicopter": payload.get("components_by_helicopter", {}),
+            "components_by_aircraft": payload.get("components_by_aircraft", {}),
+        },
+        "components": components,
+        "key_findings": key_findings,
+        "regulatory_validation": regulatory_validation,
+        "gaps": gaps,
+        "contradictions": contradictions,
+        "recommendations": payload.get("recommendations", summary_payload.get("recommendations", [])),
+        "notes": payload.get("notes", []),
+        "_research_metadata": research_metadata,
+        "_canvas_stats": canvas_stats,
+        "_raw_model_output": payload,
+    }
 
 
 async def get_asset_context(asset_id: str) -> dict:
@@ -194,6 +875,10 @@ async def main():
     print(f"\n{'='*60}")
     print("  Asset Dossier Research Agent")
     print(f"{'='*60}\n")
+    
+    # 0. Ensure workdir exists before config initialization
+    workdir = Path("workdir")
+    workdir.mkdir(parents=True, exist_ok=True)
     
     # 1. Initialize configuration
     print(f"Loading configuration from: {args.config}")
@@ -335,15 +1020,33 @@ async def main():
         else:
             final_result = result
 
+        # Normalize ToolResult payload (e.g. from final_answer_tool)
+        final_result = _unwrap_tool_result(final_result)
+
+        # Debug: Log what we got from the agent
+        logger.debug(f"Agent returned type: {type(final_result)}")
+        if isinstance(final_result, str):
+            logger.debug(f"Agent returned string (first 200 chars): {final_result[:200]}")
+
+        # Ensure final_result is parsed JSON, not a string
         if isinstance(final_result, str):
             try:
-                sanitized = _sanitize_json_text(final_result)
-                parsed = json.loads(sanitized)
+                parsed = _loads_json_with_repair(final_result)
+                # Handle double-encoded JSON
                 if isinstance(parsed, str):
-                    parsed = json.loads(_sanitize_json_text(parsed))
+                    logger.debug("Detected double-encoded JSON, parsing again...")
+                    parsed = _loads_json_with_repair(parsed)
                 final_result = parsed
+                logger.debug(f"Successfully parsed JSON, type: {type(final_result)}")
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error at position {e.pos}: {e.msg}")
+                logger.error(f"Context around error: {final_result[max(0, e.pos-50):e.pos+50]}")
+                # If parsing fails, wrap the string in a dict
+                final_result = {"raw_output": final_result, "parse_error": str(e)}
             except Exception as e:
-                logger.warning(f"Failed to sanitize/parse JSON output: {e}")
+                logger.error(f"Failed to sanitize/parse JSON output: {e}", exc_info=True)
+                # If parsing fails, wrap the string in a dict
+                final_result = {"raw_output": final_result, "parse_error": str(e)}
         
     except Exception as e:
         logger.error(f"Agent execution failed: {e}")
@@ -352,34 +1055,127 @@ async def main():
     
     # 11. Build output with metadata
     processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
-    
-    if isinstance(final_result, str):
-        try:
-            sanitized = _sanitize_json_text(final_result)
-            parsed = json.loads(sanitized)
-            if isinstance(parsed, str):
-                parsed = json.loads(_sanitize_json_text(parsed))
-            final_result = parsed
-        except Exception as e:
-            logger.warning(f"Failed to sanitize/parse JSON output before save: {e}")
 
-    output = {
-        "research_metadata": {
-            "asset_id": args.asset_id,
-            "asset_name": asset_context.get("asset_name"),
+    # Defensive normalization in case a ToolResult slipped through
+    final_result = _unwrap_tool_result(final_result)
+    
+    # Final parsing attempt - ensure result is always a dict, never a string
+    if isinstance(final_result, str):
+        logger.warning(f"final_result is still a string before save! Attempting final parse...")
+        try:
+            parsed = _loads_json_with_repair(final_result)
+            if isinstance(parsed, str):
+                logger.debug("Double-encoded JSON detected in final parse")
+                parsed = _loads_json_with_repair(parsed)
+            final_result = parsed
+            logger.info(f"Successfully parsed final_result, now type: {type(final_result)}")
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error in final parse at position {e.pos}: {e.msg}")
+            logger.error(f"Context: {final_result[max(0, e.pos-100):e.pos+100]}")
+            # Store as structured error instead of string
+            final_result = {
+                "error": "Failed to parse agent output as JSON",
+                "parse_error": str(e),
+                "raw_output_preview": final_result[:1000] if len(final_result) > 1000 else final_result
+            }
+
+    # If previous fallback stored JSON text in parsed_result, parse and merge it now.
+    if (
+        isinstance(final_result, dict)
+        and isinstance(final_result.get("parsed_result"), str)
+        and final_result["parsed_result"].lstrip().startswith(("{", "["))
+    ):
+        try:
+            reparsed = _loads_json_with_repair(final_result["parsed_result"])
+            if isinstance(reparsed, str):
+                reparsed = _loads_json_with_repair(reparsed)
+            if isinstance(reparsed, dict):
+                warning = final_result.get("_warning")
+                final_result = reparsed
+                if warning:
+                    final_result["_warning"] = warning
+                logger.info("Recovered dict from stringified parsed_result")
+            else:
+                final_result["parsed_result"] = reparsed
+        except Exception as e:
+            logger.warning(f"Could not parse parsed_result field: {e}")
+        except Exception as e:
+            logger.error(f"Failed to parse JSON output before save: {e}", exc_info=True)
+            logger.error(f"Raw output (first 500 chars): {final_result[:500]}")
+            # Store as structured error instead of string
+            final_result = {
+                "error": "Failed to parse agent output as JSON",
+                "parse_error": str(e),
+                "raw_output_preview": final_result[:1000] if len(final_result) > 1000 else final_result
+            }
+    
+    # Ensure final_result is a dict, not a string
+    if not isinstance(final_result, dict):
+        logger.error(f"CRITICAL: final_result is not a dict before output building! Type: {type(final_result)}, Value: {str(final_result)[:200]}")
+        final_result = {"parsed_result": final_result, "_warning": "Output was not a dict"}
+
+    # Build output structure matching SummaryJson schema
+    # Use final_result as the base, ensuring it's a dict with proper structure
+    logger.info(f"Building output structure. final_result type: {type(final_result)}")
+    
+    if isinstance(final_result, dict):
+        logger.info(f"final_result is dict with keys: {list(final_result.keys())[:10]}")
+        # Start with final_result as base
+        output = final_result.copy()
+        
+        # Ensure required top-level fields exist
+        output["asset_id"] = output.get("asset_id", args.asset_id)
+        output["asset_name"] = output.get("asset_name", asset_context.get("asset_name", f"Asset {args.asset_id}"))
+        
+        # Build/update metadata section
+        if "metadata" not in output:
+            output["metadata"] = {}
+        output["metadata"].update({
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+            "total_components": output.get("total_components", len(output.get("components", []))),
+            "total_helicopters": output.get("total_helicopters"),
+            "total_aircraft": output.get("total_aircraft"),
+            "source_pages_count": asset_context.get("total_pages", 0),
+            "components_by_helicopter": output.get("components_by_helicopter", {}),
+            "components_by_aircraft": output.get("components_by_aircraft", {}),
+        })
+        
+        # Add research metadata for debugging/tracking (optional)
+        output["_research_metadata"] = {
             "prompt": args.prompt,
             "total_pages_analyzed": asset_context.get("total_pages", 0),
-            "total_pages_in_asset": asset_context.get("total_pages", 0),
             "research_depth": args.depth,
             "processing_time_ms": int(processing_time),
             "agent_version": "1.0.0",
             "trace_id": trace_id,
             "database_connected": asset_context.get("database_connected", False),
             "agents_used": list(agent.managed_agents.keys()) if hasattr(agent, 'managed_agents') and agent.managed_agents else [],
-        },
-        "result": final_result,
-        "canvas_stats": canvas.get_stats()
-    }
+        }
+        
+        # Add canvas stats for debugging (optional)
+        output["_canvas_stats"] = canvas.get_stats()
+        
+        logger.info(f"Output structure built. Top-level keys: {list(output.keys())[:15]}")
+    else:
+        # Fallback: if final_result is not a dict, create structured error output
+        output = {
+            "asset_id": args.asset_id,
+            "asset_name": asset_context.get("asset_name", f"Asset {args.asset_id}"),
+            "metadata": {
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+                "total_components": 0,
+                "source_pages_count": asset_context.get("total_pages", 0),
+            },
+            "components": [],
+            "key_findings": [],
+            "error": "Agent output was not in expected JSON format",
+            "raw_output": str(final_result)[:1000] if isinstance(final_result, str) else str(final_result),
+            "_research_metadata": {
+                "prompt": args.prompt,
+                "processing_time_ms": int(processing_time),
+                "trace_id": trace_id,
+            }
+        }
     
     # 12. Save output
     run_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -387,8 +1183,120 @@ async def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     output_path = args.output or str(run_dir / "output.json")
     
+    # Final validation: ensure output is proper JSON structure, not stringified
+    # Check for old structure and fix it
+    if isinstance(output, dict):
+        # If output has old structure (research_metadata, result, canvas_stats), transform it
+        if "research_metadata" in output and "result" in output and "canvas_stats" in output:
+            logger.warning("Detected old output structure. Transforming to new format...")
+            try:
+                # Parse the stringified result
+                result_str = output.pop("result")
+                if isinstance(result_str, str):
+                    parsed_result = _loads_json_with_repair(result_str)
+                    if isinstance(parsed_result, str):
+                        parsed_result = _loads_json_with_repair(parsed_result)
+                else:
+                    parsed_result = result_str
+                
+                # Start fresh with parsed result as base
+                if isinstance(parsed_result, dict):
+                    output = parsed_result.copy()
+                else:
+                    output = {"parsed_result": parsed_result}
+                
+                # Extract old metadata before it gets lost
+                old_meta = {}
+                if "research_metadata" in output:
+                    old_meta = output.pop("research_metadata")
+                elif isinstance(output, dict) and "research_metadata" in output:
+                    old_meta = output.pop("research_metadata")
+                
+                # Ensure asset_id and asset_name are set
+                output["asset_id"] = output.get("asset_id", old_meta.get("asset_id", args.asset_id) if isinstance(old_meta, dict) else args.asset_id)
+                output["asset_name"] = output.get("asset_name", old_meta.get("asset_name", asset_context.get("asset_name")) if isinstance(old_meta, dict) else asset_context.get("asset_name", f"Asset {args.asset_id}"))
+                
+                if "metadata" not in output:
+                    output["metadata"] = {}
+                output["metadata"].update({
+                    "updated_at": datetime.utcnow().isoformat() + "Z",
+                    "total_components": output.get("total_components", len(output.get("components", []))),
+                    "total_helicopters": output.get("total_helicopters"),
+                    "total_aircraft": output.get("total_aircraft"),
+                    "source_pages_count": old_meta.get("total_pages_analyzed", asset_context.get("total_pages", 0)),
+                    "components_by_helicopter": output.get("components_by_helicopter", {}),
+                    "components_by_aircraft": output.get("components_by_aircraft", {}),
+                })
+                
+                # Move canvas_stats to _canvas_stats
+                canvas_stats = output.pop("canvas_stats", {})
+                output["_canvas_stats"] = canvas_stats
+                
+                # Add research metadata as _research_metadata
+                output["_research_metadata"] = old_meta
+                
+                logger.info("Successfully transformed old output structure to new format")
+            except Exception as e:
+                logger.error(f"Failed to transform old structure: {e}", exc_info=True)
+        # If output has stringified result field, fix it
+        elif "result" in output and isinstance(output["result"], str):
+            logger.error("CRITICAL: Output contains stringified 'result' field! Attempting to fix...")
+            try:
+                # Try to parse the result field
+                parsed_result = _loads_json_with_repair(output["result"])
+                if isinstance(parsed_result, str):
+                    parsed_result = _loads_json_with_repair(parsed_result)
+                # Merge parsed result into output, removing the stringified version
+                output.pop("result")
+                if isinstance(parsed_result, dict):
+                    output.update(parsed_result)
+                else:
+                    output["parsed_result"] = parsed_result
+                logger.info("Fixed stringified result field")
+            except Exception as e:
+                logger.error(f"Failed to fix stringified result: {e}", exc_info=True)
+    
+    # Ensure output is a dict before saving
+    if not isinstance(output, dict):
+        logger.error(f"Output is not a dict! Type: {type(output)}. Converting...")
+        output = {"error": "Output format error", "raw_output": str(output)}
+    
+    # Final check: ensure no stringified JSON fields remain
+    def check_and_fix_stringified(obj, path=""):
+        """Recursively check for stringified JSON and fix it."""
+        if isinstance(obj, dict):
+            for key, value in list(obj.items()):
+                if isinstance(value, str) and (value.strip().startswith("{") or value.strip().startswith("[")):
+                    try:
+                        parsed = _loads_json_with_repair(value)
+                        obj[key] = parsed
+                        logger.debug(f"Fixed stringified JSON at {path}.{key}")
+                        check_and_fix_stringified(parsed, f"{path}.{key}")
+                    except:
+                        pass
+                else:
+                    check_and_fix_stringified(value, f"{path}.{key}")
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                check_and_fix_stringified(item, f"{path}[{i}]")
+    
+    check_and_fix_stringified(output)
+
+    # Canonicalize output into one stable schema and enrich source citations.
+    page_ids: set[str] = set()
+    _collect_page_ids(output, page_ids)
+    page_lookup = await _fetch_page_lookup(page_ids)
+    output = _canonicalize_output(
+        payload=output,
+        args=args,
+        asset_context=asset_context,
+        page_lookup=page_lookup,
+        research_metadata=output.get("_research_metadata", {}),
+        canvas_stats=output.get("_canvas_stats", {}),
+    )
+
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, default=str)
+        json.dump(output, f, indent=2, default=str, ensure_ascii=False)
     
     # Save canvas if it has entries
     if canvas.entries:
