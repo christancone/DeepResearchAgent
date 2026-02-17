@@ -31,8 +31,12 @@ services:
       - ./workdir:/app/workdir
       # Mount configs if you want to edit them without rebuilding
       - ./configs:/app/configs:ro
-    # Keep container running for interactive use
+      # Mount source code for live updates (keeps model registry in sync)
+      - ./src:/app/src
+      - ./examples:/app/examples
+      - ./main.py:/app/main.py
+    ports:
+      - "8000:8000"
     stdin_open: true
     tty: true
-    # Override command to keep container running
-    command: tail -f /dev/null
+    command: uvicorn api.server:app --host 0.0.0.0 --port 8000

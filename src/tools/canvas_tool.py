@@ -160,6 +160,41 @@ Use this tool to:
     def get_shared_canvas(cls) -> Optional[WorkingMemoryCanvas]:
         """Get the shared canvas instance."""
         return cls._shared_canvas
+
+    @staticmethod
+    def _normalize_citations(citations: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Normalize citation objects and drop empty placeholders."""
+        normalized: List[Dict[str, Any]] = []
+        for raw in citations or []:
+            if not isinstance(raw, dict):
+                continue
+            page_id = raw.get("page_id", raw.get("pageId", raw.get("id")))
+            page_index = raw.get("page_index", raw.get("pageIndex"))
+            document_id = raw.get("document_id", raw.get("documentId"))
+            document_name = raw.get("document_name", raw.get("documentName"))
+            enhanced_s3_key = raw.get("enhanced_s3_key", raw.get("enhancedS3Key"))
+            excerpt = raw.get("excerpt")
+            confidence = raw.get("confidence")
+
+            # Drop empty/placeholder citation objects like {}
+            if not any(
+                value is not None and value != ""
+                for value in (page_id, page_index, document_id, document_name, enhanced_s3_key, excerpt, confidence)
+            ):
+                continue
+
+            normalized.append(
+                {
+                    "page_id": page_id,
+                    "page_index": page_index,
+                    "document_id": document_id,
+                    "document_name": document_name,
+                    "enhanced_s3_key": enhanced_s3_key,
+                    "excerpt": excerpt,
+                    "confidence": confidence,
+                }
+            )
+        return normalized
     
     async def forward(
         self,
@@ -200,7 +235,7 @@ Use this tool to:
             ToolResult with operation result or error
         """
         tags = tags or []
-        citations = citations or []
+        citations = self._normalize_citations(citations)
         
         try:
             if action == "add":

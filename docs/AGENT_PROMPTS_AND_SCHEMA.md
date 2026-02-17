@@ -133,6 +133,18 @@ Validates ADs, SBs, and regulatory requirements.
 
 ## 2. JSON Structure Schema
 
+Note: Runtime output is now legacy-compatible at the root level for downstream consumers.  
+Primary root keys are:
+- `asset_id`, `metadata`, `asset_name`
+- `asset_identification`, `executive_summary`, `utilization_metrics`
+- `components`, `configuration`, `risk_assessment`
+- `key_findings`, `important_points`
+
+Compatibility behavior:
+- Legacy `source_pages` fields are page-index integer arrays.
+- Companion `source_citations` fields preserve enriched citation metadata (`pageId`, `documentId`, `documentName`, `enhancedS3Key`) when available.
+- For high page-count dossiers, adaptive completeness targets are applied to avoid sparse output.
+
 ### 2.1 Main Output Schema: `AssetResearchOutput`
 
 Defined in `src/schemas/asset_research_output.py` using Pydantic models.
@@ -410,10 +422,11 @@ The `result` field contains a JSON string that should be parsed to get the actua
 
 ### 4.2 Output Format Requirements
 1. Output must be valid JSON
-2. Must match `AssetResearchOutput` schema
+2. Must include legacy-compatible root schema fields
 3. All findings must include source citations
 4. Regulatory items must be validated against FAA/EASA databases
 5. Gaps and contradictions must be explicitly reported
+6. Large dossiers must produce richer coverage (not minimal findings-only output)
 
 ### 4.3 Template Variables Available
 - `{{asset_id}}`: The asset UUID

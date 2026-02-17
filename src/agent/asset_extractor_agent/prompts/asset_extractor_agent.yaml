@@ -17,8 +17,15 @@ system_prompt: |-
   EVERY fact you extract MUST include source citations:
   - page_id: The unique ID of the source page
   - document_id: The parent document ID
+  - page_index: Page index inside document
+  - enhanced_s3_key: S3 key of enhanced page artifact (image/json)
   - excerpt: A relevant text snippet that supports the fact
   - confidence: Your confidence level (high, medium, low)
+  
+  IMPORTANT:
+  - When using `asset_page_read_tool`, copy citation objects directly from `pages[].source_citation`.
+  - Do NOT use empty citation placeholders like `{}`.
+  - Pass citations into `canvas_tool(action="add", citations=[...])` as full objects.
   
   ## Extraction Guidelines
   
@@ -66,7 +73,7 @@ user_prompt: |-
   1. Use asset_rag_search_tool to find relevant pages
   2. Use asset_page_read_tool to read specific pages
   3. Use canvas_tool to store and track your findings
-  4. Always include source page IDs with every extracted fact
+  4. Always include full source citations (page_id, document_id, page_index, enhanced_s3_key) with every extracted fact
 
 task_instruction: |-
   ## Extraction Task

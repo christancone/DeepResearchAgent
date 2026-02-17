@@ -63,6 +63,12 @@ class DocumentTreeTool(AsyncTool):
                 "nullable": True,
                 "default": False
             },
+            "require_pages": {
+                "type": "boolean",
+                "description": "Only return documents that have at least one extracted page",
+                "nullable": True,
+                "default": True
+            },
             "limit": {
                 "type": "integer",
                 "description": "Maximum documents to return",
@@ -94,6 +100,7 @@ class DocumentTreeTool(AsyncTool):
         name_contains: Optional[str] = None,
         status_filter: Optional[str] = None,
         include_page_ids: bool = False,
+        require_pages: bool = True,
         limit: int = 50
     ) -> ToolResult:
         """Navigate and filter document tree."""
@@ -133,6 +140,12 @@ class DocumentTreeTool(AsyncTool):
                 conditions.append(f"dpr.status = ${param_idx}")
                 params.append(status_filter)
                 param_idx += 1
+
+            # By default, only return documents that have materialized pages.
+            if require_pages:
+                conditions.append(
+                    "EXISTS (SELECT 1 FROM document_pages dp2 WHERE dp2.document_id = dpr.id)"
+                )
             
             # Add limit
             params.append(limit)
@@ -211,7 +224,8 @@ class DocumentTreeTool(AsyncTool):
                     "path_filter": path_filter,
                     "doc_type_filter": doc_type_filter,
                     "name_contains": name_contains,
-                    "status_filter": status_filter
+                    "status_filter": status_filter,
+                    "require_pages": require_pages,
                 }
             })
         

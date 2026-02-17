@@ -197,38 +197,123 @@ def _collect_page_ids(value: Any, page_ids: set[str]) -> None:
             _collect_page_ids(item, page_ids)
 
 
-async def _fetch_page_lookup(page_ids: set[str]) -> dict[str, dict[str, Any]]:
-    """Fetch page metadata for citation enrichment."""
-    if not page_ids:
+def _collect_source_page_indices(value: Any, page_indices: set[int]) -> None:
+    """Collect integer source page indices from citation-like fields."""
+    if isinstance(value, list):
+        for item in value:
+            _collect_source_page_indices(item, page_indices)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"source_pages", "sourcePages", "pageIndex", "page_index", "pages"}:
+                _collect_source_page_indices(item, page_indices)
+            elif isinstance(item, (dict, list)):
+                _collect_source_page_indices(item, page_indices)
+        return
+    if isinstance(value, int) and value >= 0:
+        page_indices.add(value)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if raw.isdigit():
+            page_indices.add(int(raw))
+
+
+async def _fetch_page_lookup(
+    page_ids: set[str],
+    asset_id: str | None = None,
+    page_indices: set[int] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Fetch page metadata for citation enrichment.
+
+    Includes two lookup modes:
+    - Direct page UUIDs (exact)
+    - Numeric page indices resolved by (asset_id, page_index) only when unique
+    """
+    if not page_ids and not (asset_id and page_indices):
         return {}
     try:
         from src.tools.asset_dossier.db_client import SupabaseAsyncClient
 
         db = await SupabaseAsyncClient.get_instance()
-        rows = await db.fetch(
-            """
-            SELECT
-                dp.id AS page_id,
-                dp.page_index,
-                dp.enhanced_s3_key,
-                dpr.id AS document_id,
-                dpr.file_name AS document_name
-            FROM document_pages dp
-            JOIN document_processing_records dpr ON dp.document_id = dpr.id
-            WHERE dp.id::text = ANY($1::text[])
-            """,
-            list(page_ids),
-        )
-        return {
-            str(row["page_id"]).lower(): {
-                "pageId": str(row["page_id"]),
-                "pageIndex": row.get("page_index"),
-                "documentId": str(row["document_id"]) if row.get("document_id") else None,
-                "documentName": row.get("document_name"),
-                "enhancedS3Key": row.get("enhanced_s3_key"),
-            }
-            for row in rows
-        }
+        lookup: dict[str, dict[str, Any]] = {}
+
+        if page_ids:
+            rows = await db.fetch(
+                """
+                SELECT
+                    dp.id AS page_id,
+                    dp.page_index,
+                    dp.enhanced_s3_key,
+                    dpr.id AS document_id,
+                    dpr.file_name AS document_name
+                FROM document_pages dp
+                JOIN document_processing_records dpr ON dp.document_id = dpr.id
+                WHERE dp.id::text = ANY($1::text[])
+                """,
+                list(page_ids),
+            )
+            for row in rows:
+                lookup[str(row["page_id"]).lower()] = {
+                    "pageId": str(row["page_id"]),
+                    "pageIndex": row.get("page_index"),
+                    "documentId": str(row["document_id"]) if row.get("document_id") else None,
+                    "documentName": row.get("document_name"),
+                    "enhancedS3Key": row.get("enhanced_s3_key"),
+                }
+
+        # Best-effort backfill for numeric source_pages using (asset_id, page_index).
+        # Only enrich when a page_index resolves uniquely within the asset.
+        if asset_id and page_indices:
+            index_rows = await db.fetch(
+                """
+                SELECT
+                    dp.id AS page_id,
+                    dp.page_index,
+                    dp.enhanced_s3_key,
+                    dpr.id AS document_id,
+                    dpr.file_name AS document_name
+                FROM document_pages dp
+                JOIN document_processing_records dpr ON dp.document_id = dpr.id
+                WHERE dpr.asset_id = $1 AND dp.page_index = ANY($2::int[])
+                """,
+                asset_id,
+                sorted(page_indices),
+            )
+            by_index: dict[int, list[dict[str, Any]]] = {}
+            for row in index_rows:
+                idx = row.get("page_index")
+                if isinstance(idx, int):
+                    by_index.setdefault(idx, []).append(row)
+                # Also keep direct page_id lookup for any rows discovered here.
+                if row.get("page_id"):
+                    lookup[str(row["page_id"]).lower()] = {
+                        "pageId": str(row["page_id"]),
+                        "pageIndex": row.get("page_index"),
+                        "documentId": str(row["document_id"]) if row.get("document_id") else None,
+                        "documentName": row.get("document_name"),
+                        "enhancedS3Key": row.get("enhanced_s3_key"),
+                    }
+
+            ambiguous_indices: list[int] = []
+            for idx, rows_for_index in by_index.items():
+                if len(rows_for_index) == 1:
+                    row = rows_for_index[0]
+                    lookup[f"__page_index__:{idx}"] = {
+                        "pageId": str(row["page_id"]),
+                        "pageIndex": row.get("page_index"),
+                        "documentId": str(row["document_id"]) if row.get("document_id") else None,
+                        "documentName": row.get("document_name"),
+                        "enhancedS3Key": row.get("enhanced_s3_key"),
+                    }
+                else:
+                    ambiguous_indices.append(idx)
+            if ambiguous_indices:
+                logger.warning(
+                    "Could not uniquely resolve source page indices within asset "
+                    f"{asset_id}: {sorted(ambiguous_indices)}"
+                )
+
+        return lookup
     except Exception as e:
         logger.warning(f"Could not enrich citations from DB: {e}")
         return {}
@@ -277,10 +362,53 @@ def _normalize_source_pages(
                         "enhancedS3Key": item.get("enhancedS3Key", item.get("enhanced_s3_key", enriched.get("enhancedS3Key"))),
                     }
                 )
+                continue
+
+            # Keep page-index-only citations (legacy style) even without page_id.
+            page_index_only = item.get("pageIndex", item.get("page_index"))
+            if isinstance(page_index_only, int):
+                enriched = page_lookup.get(f"__page_index__:{page_index_only}", {})
+                normalized.append(
+                    {
+                        "pageId": enriched.get("pageId"),
+                        "pageIndex": page_index_only,
+                        "documentId": item.get("documentId", item.get("document_id", enriched.get("documentId"))),
+                        "documentName": item.get("documentName", item.get("document_name", enriched.get("documentName"))),
+                        "enhancedS3Key": item.get("enhancedS3Key", item.get("enhanced_s3_key", enriched.get("enhancedS3Key"))),
+                    }
+                )
+            continue
+
+        # Legacy source page index as integer.
+        if isinstance(item, int):
+            enriched = page_lookup.get(f"__page_index__:{item}", {})
+            normalized.append(
+                {
+                    "pageId": enriched.get("pageId"),
+                    "pageIndex": item,
+                    "documentId": enriched.get("documentId"),
+                    "documentName": enriched.get("documentName"),
+                    "enhancedS3Key": enriched.get("enhancedS3Key"),
+                }
+            )
             continue
 
         if isinstance(item, str):
             raw = item.strip()
+            # Numeric page index encoded as string.
+            if raw.isdigit():
+                page_index = int(raw)
+                enriched = page_lookup.get(f"__page_index__:{page_index}", {})
+                normalized.append(
+                    {
+                        "pageId": enriched.get("pageId"),
+                        "pageIndex": page_index,
+                        "documentId": enriched.get("documentId"),
+                        "documentName": enriched.get("documentName"),
+                        "enhancedS3Key": enriched.get("enhancedS3Key"),
+                    }
+                )
+                continue
             # Handle "uuid|index" patterns where left side can be document_id.
             if "|" in raw:
                 left, right = raw.split("|", 1)
@@ -418,6 +546,110 @@ def _normalize_with_fallback(
         if normalized:
             return normalized
     return []
+
+
+def _build_richness_policy(total_pages: int) -> dict[str, int]:
+    """Adaptive minimum coverage targets based on dossier size."""
+    if total_pages >= 120:
+        return {"min_key_findings": 12, "min_important_points": 15, "min_critical_risks": 5}
+    if total_pages >= 60:
+        return {"min_key_findings": 8, "min_important_points": 10, "min_critical_risks": 3}
+    if total_pages >= 25:
+        return {"min_key_findings": 5, "min_important_points": 7, "min_critical_risks": 2}
+    return {"min_key_findings": 3, "min_important_points": 5, "min_critical_risks": 1}
+
+
+def _source_page_indices(source_pages: list[dict[str, Any]]) -> list[int]:
+    """Convert normalized citation objects to sorted unique page_index integers."""
+    indices = {
+        item.get("pageIndex")
+        for item in source_pages
+        if isinstance(item, dict) and isinstance(item.get("pageIndex"), int)
+    }
+    return sorted(indices)
+
+
+def _normalize_legacy_source_bundle(
+    source_value: Any,
+    page_lookup: dict[str, dict[str, Any]],
+    doc_page_index: dict[tuple[str, int], str] | None = None,
+    fallback_sources: list[Any] | None = None,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Return legacy source_pages (indices) plus enriched companion citations."""
+    citations = _normalize_with_fallback(
+        source_value,
+        page_lookup,
+        doc_page_index,
+        fallback_sources,
+    )
+    return _source_page_indices(citations), citations
+
+
+def _normalize_component_status(status: Any) -> str:
+    """Normalize component status to legacy uppercase style."""
+    if not isinstance(status, str) or not status.strip():
+        return "UNKNOWN"
+    normalized = status.strip().replace("-", "_").replace(" ", "_").upper()
+    aliases = {
+        "SERVICEABLE": "SERVICEABLE",
+        "UNSERVICEABLE": "UNSERVICEABLE",
+        "OVERHAULED": "OVERHAULED",
+        "REPAIRED": "REPAIRED",
+        "REMOVED": "REMOVED",
+        "NEW": "NEW",
+        "INSPECTED": "INSPECTED",
+        "CORE": "UNSERVICEABLE",
+        "SCRAP": "UNSERVICEABLE",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _normalize_nested_sub_components(
+    entries: Any,
+    page_lookup: dict[str, dict[str, Any]],
+    doc_page_index: dict[tuple[str, int], str] | None = None,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        source_pages, source_citations = _normalize_legacy_source_bundle(
+            entry.get("source_pages", entry.get("sourcePages")),
+            page_lookup,
+            doc_page_index,
+            _extract_source_candidates(entry),
+        )
+        node = {
+            "id": entry.get("id"),
+            "name": entry.get("name"),
+            "part_number": entry.get("part_number", entry.get("partNumber")),
+            "serial_number": entry.get("serial_number", entry.get("serialNumber")),
+            "source_pages": source_pages,
+            "source_citations": source_citations,
+        }
+        nested = _normalize_nested_sub_components(
+            entry.get("sub_components", entry.get("subComponents")),
+            page_lookup,
+            doc_page_index,
+        )
+        if nested:
+            node["sub_components"] = nested
+        normalized.append(node)
+    return normalized
+
+
+def _build_richness_requirements(total_pages: int) -> str:
+    """Runtime task addendum to prevent early sparse outputs on large dossiers."""
+    policy = _build_richness_policy(total_pages)
+    return (
+        "\n### Coverage and Completeness Requirements\n"
+        f"- This dossier has {total_pages} pages; do not stop at minimal output.\n"
+        f"- Provide at least {policy['min_key_findings']} high-value key findings when evidence exists.\n"
+        f"- Provide at least {policy['min_important_points']} important points when evidence exists.\n"
+        "- Must-capture categories when present: serial mismatches, unserviceable/core/scrap indicators, "
+        "physical defects, TSN/TSO/CSN/CSO, major maintenance events, compliance issues, documentation gaps.\n"
+        "- Ensure cross-section consistency: critical blockers must appear in key_findings and risk_assessment.\n"
+    )
 
 
 def _canonicalize_output(
@@ -768,7 +1000,7 @@ def _canonicalize_output(
             elif isinstance(g, str):
                 gaps.append({"title": "gap", "description": g, "source_pages": [], "confidence": "medium"})
 
-    return {
+    canonical_output = {
         "asset_id": asset_id,
         "asset_name": asset_name,
         "metadata": {
@@ -791,6 +1023,509 @@ def _canonicalize_output(
         "_canvas_stats": canvas_stats,
         "_raw_model_output": payload,
     }
+
+    def _asset_status(status_value: Any) -> str:
+        if isinstance(status_value, str) and status_value.strip():
+            normalized = status_value.strip().lower()
+            if normalized in {"serviceable", "unserviceable", "core", "scrap", "overhauled", "removed", "unknown"}:
+                return normalized.capitalize() if normalized != "unknown" else "Unknown"
+        joined_findings = " ".join(
+            [
+                str(f.get("content", ""))
+                for f in canonical_output.get("key_findings", [])
+                if isinstance(f, dict)
+            ]
+        ).lower()
+        if any(word in joined_findings for word in ("unserviceable", "core", "scrap", "ber", "beyond repair")):
+            return "Unserviceable"
+        if any(word in joined_findings for word in ("serviceable", "released to service", "airworthy")):
+            return "Serviceable"
+        return "Unknown"
+
+    def _metric(raw_value: Any, unit: str) -> dict[str, Any]:
+        if isinstance(raw_value, dict):
+            value = raw_value.get("value")
+            raw_unit = raw_value.get("unit") or unit
+            return {"value": value if isinstance(value, (int, float)) else None, "unit": str(raw_unit)}
+        if isinstance(raw_value, (int, float)):
+            return {"value": raw_value, "unit": unit}
+        return {"value": None, "unit": unit}
+
+    def _dedupe_text_rows(rows: list[dict[str, Any]], text_key: str) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            text = str(row.get(text_key, "")).strip().lower()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(row)
+        return out
+
+    ai_in = payload.get("asset_identification") if isinstance(payload.get("asset_identification"), dict) else {}
+    es_in = payload.get("executive_summary") if isinstance(payload.get("executive_summary"), dict) else {}
+    util_in = payload.get("utilization_metrics") if isinstance(payload.get("utilization_metrics"), dict) else {}
+    config_in = payload.get("configuration") if isinstance(payload.get("configuration"), dict) else {}
+    risk_in = payload.get("risk_assessment") if isinstance(payload.get("risk_assessment"), dict) else {}
+    legacy_policy = _build_richness_policy(int(asset_context.get("total_pages", 0) or 0))
+
+    model_pages, model_citations = _normalize_legacy_source_bundle(
+        ai_in.get("model_source_pages", ai_in.get("modelSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(ai_in.get("model")),
+    )
+    serial_pages, serial_citations = _normalize_legacy_source_bundle(
+        ai_in.get("serial_number_source_pages", ai_in.get("serialNumberSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(ai_in.get("serial_number")),
+    )
+    asset_type_pages, asset_type_citations = _normalize_legacy_source_bundle(
+        ai_in.get("asset_type_source_pages", ai_in.get("assetTypeSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(ai_in.get("asset_type")),
+    )
+    part_pages, part_citations = _normalize_legacy_source_bundle(
+        ai_in.get("part_number_source_pages", ai_in.get("partNumberSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(ai_in.get("part_number")),
+    )
+    status_pages, status_citations = _normalize_legacy_source_bundle(
+        ai_in.get("status_source_pages", ai_in.get("statusSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(ai_in.get("status")),
+    )
+
+    operational_pages, operational_citations = _normalize_legacy_source_bundle(
+        es_in.get("operational_state_source_pages", es_in.get("operationalStateSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(es_in.get("operational_state")),
+    )
+    operator_pages, operator_citations = _normalize_legacy_source_bundle(
+        es_in.get("last_operator_source_pages", es_in.get("lastOperatorSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(es_in.get("last_operator")),
+    )
+    location_pages, location_citations = _normalize_legacy_source_bundle(
+        es_in.get("location_source_pages", es_in.get("locationSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(es_in.get("location")),
+    )
+    preservation_pages, preservation_citations = _normalize_legacy_source_bundle(
+        es_in.get("preservation_status_source_pages", es_in.get("preservationStatusSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(es_in.get("preservation_status")),
+    )
+
+    tsn_pages, tsn_citations = _normalize_legacy_source_bundle(
+        util_in.get("total_time_since_new_source_pages", util_in.get("totalTimeSinceNewSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(util_in.get("total_time_since_new")),
+    )
+    csn_pages, csn_citations = _normalize_legacy_source_bundle(
+        util_in.get("total_cycles_since_new_source_pages", util_in.get("totalCyclesSinceNewSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(util_in.get("total_cycles_since_new")),
+    )
+    tso_pages, tso_citations = _normalize_legacy_source_bundle(
+        util_in.get("time_since_overhaul_source_pages", util_in.get("timeSinceOverhaulSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(util_in.get("time_since_overhaul")),
+    )
+    cso_pages, cso_citations = _normalize_legacy_source_bundle(
+        util_in.get("cycles_since_overhaul_source_pages", util_in.get("cyclesSinceOverhaulSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(util_in.get("cycles_since_overhaul")),
+    )
+    last_activity_pages, last_activity_citations = _normalize_legacy_source_bundle(
+        util_in.get("last_activity_date_source_pages", util_in.get("lastActivityDateSourcePages")),
+        page_lookup,
+        doc_page_index,
+        _extract_source_candidates(util_in.get("last_activity_date")),
+    )
+
+    legacy_components: list[dict[str, Any]] = []
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        source_pages, source_citations = _normalize_legacy_source_bundle(
+            component.get("source_pages", component.get("sourcePages")),
+            page_lookup,
+            doc_page_index,
+            _extract_source_candidates(component),
+        )
+        normalized_component: dict[str, Any] = {
+            "id": component.get("id"),
+            "name": component.get("name") or component.get("component") or "Component",
+            "status": _normalize_component_status(component.get("status", component.get("condition"))),
+            "category": component.get("category", component.get("component_type", "OTHER")),
+            "part_number": component.get("part_number", component.get("partNumber")),
+            "serial_number": component.get("serial_number", component.get("serialNumber")),
+            "manufacturer": component.get("manufacturer"),
+            "source_pages": source_pages,
+            "source_citations": source_citations,
+        }
+        if isinstance(component.get("last_work"), dict):
+            normalized_component["last_work"] = component.get("last_work")
+        if isinstance(component.get("life_limit"), dict):
+            normalized_component["life_limit"] = component.get("life_limit")
+        if isinstance(component.get("utilization"), dict):
+            normalized_component["utilization"] = component.get("utilization")
+        if isinstance(component.get("work_history"), list):
+            work_rows = []
+            for row in component.get("work_history"):
+                if not isinstance(row, dict):
+                    continue
+                row_pages, row_citations = _normalize_legacy_source_bundle(
+                    row.get("source_pages", row.get("sourcePages")),
+                    page_lookup,
+                    doc_page_index,
+                    _extract_source_candidates(row),
+                )
+                out_row = dict(row)
+                out_row["source_pages"] = row_pages
+                out_row["source_citations"] = row_citations
+                work_rows.append(out_row)
+            normalized_component["work_history"] = work_rows
+        if isinstance(component.get("modifications"), list):
+            mod_rows = []
+            for row in component.get("modifications"):
+                if not isinstance(row, dict):
+                    continue
+                row_pages, row_citations = _normalize_legacy_source_bundle(
+                    row.get("source_pages", row.get("sourcePages")),
+                    page_lookup,
+                    doc_page_index,
+                    _extract_source_candidates(row),
+                )
+                out_row = dict(row)
+                out_row["source_pages"] = row_pages
+                out_row["source_citations"] = row_citations
+                mod_rows.append(out_row)
+            normalized_component["modifications"] = mod_rows
+        sub_components = _normalize_nested_sub_components(
+            component.get("sub_components", component.get("subComponents")),
+            page_lookup,
+            doc_page_index,
+        )
+        if sub_components:
+            normalized_component["sub_components"] = sub_components
+        if component.get("helicopter_id"):
+            normalized_component["helicopter_id"] = component.get("helicopter_id")
+        legacy_components.append(normalized_component)
+
+    legacy_key_findings: list[dict[str, Any]] = []
+    for finding in canonical_output["key_findings"]:
+        if not isinstance(finding, dict):
+            continue
+        finding_text = str(finding.get("content") or finding.get("title") or "").strip()
+        if not finding_text:
+            continue
+        source_citations = finding.get("source_pages") if isinstance(finding.get("source_pages"), list) else []
+        legacy_key_findings.append(
+            {
+                "finding": finding_text,
+                "source_pages": _source_page_indices(source_citations),
+                "source_citations": source_citations,
+            }
+        )
+
+    for gap in gaps:
+        if len(legacy_key_findings) >= legacy_policy["min_key_findings"]:
+            break
+        if isinstance(gap, dict):
+            text = str(gap.get("description", "")).strip()
+            if text:
+                source_citations = gap.get("source_pages") if isinstance(gap.get("source_pages"), list) else []
+                legacy_key_findings.append(
+                    {
+                        "finding": text,
+                        "source_pages": _source_page_indices(source_citations),
+                        "source_citations": source_citations,
+                    }
+                )
+
+    for component in legacy_components:
+        if len(legacy_key_findings) >= legacy_policy["min_key_findings"]:
+            break
+        status = component.get("status")
+        if isinstance(status, str) and status and status != "UNKNOWN":
+            legacy_key_findings.append(
+                {
+                    "finding": f"{component.get('name', 'Component')} status: {status}",
+                    "source_pages": component.get("source_pages", []),
+                    "source_citations": component.get("source_citations", []),
+                }
+            )
+
+    legacy_key_findings = _dedupe_text_rows(legacy_key_findings, "finding")
+
+    critical_risks: list[dict[str, Any]] = []
+    for risk in risk_in.get("critical_risks", []) if isinstance(risk_in.get("critical_risks"), list) else []:
+        if not isinstance(risk, dict):
+            continue
+        source_pages, source_citations = _normalize_legacy_source_bundle(
+            risk.get("source_pages", risk.get("sourcePages")),
+            page_lookup,
+            doc_page_index,
+            _extract_source_candidates(risk),
+        )
+        critical_risks.append(
+            {
+                "risk": risk.get("risk", risk.get("description", "")),
+                "severity": str(risk.get("severity", "MEDIUM")).upper(),
+                "implication": risk.get("implication"),
+                "source_pages": source_pages,
+                "source_citations": source_citations,
+            }
+        )
+
+    high_impact_keywords = ("mismatch", "unserviceable", "core", "scrap", "corrosion", "crack", "leak", "damage")
+    for finding in legacy_key_findings:
+        if len(critical_risks) >= legacy_policy["min_critical_risks"]:
+            break
+        text = str(finding.get("finding", ""))
+        lower = text.lower()
+        if any(k in lower for k in high_impact_keywords):
+            severity = "CRITICAL" if any(k in lower for k in ("mismatch", "unserviceable", "core", "scrap")) else "HIGH"
+            critical_risks.append(
+                {
+                    "risk": text,
+                    "severity": severity,
+                    "implication": None,
+                    "source_pages": finding.get("source_pages", []),
+                    "source_citations": finding.get("source_citations", []),
+                }
+            )
+    critical_risks = _dedupe_text_rows(critical_risks, "risk")
+
+    documentation_gaps: list[dict[str, Any]] = []
+    for gap in gaps:
+        if not isinstance(gap, dict):
+            continue
+        description = str(gap.get("description", "")).strip()
+        if not description:
+            continue
+        documentation_gaps.append(
+            {
+                "document": gap.get("title", "Gap"),
+                "impact": description,
+                "source_pages": _source_page_indices(gap.get("source_pages", [])),
+                "source_citations": gap.get("source_pages", []),
+            }
+        )
+    documentation_gaps = _dedupe_text_rows(documentation_gaps, "impact")
+
+    legacy_important_points: list[dict[str, Any]] = []
+    for point in payload.get("important_points", []) if isinstance(payload.get("important_points"), list) else []:
+        if not isinstance(point, dict):
+            continue
+        source_pages, source_citations = _normalize_legacy_source_bundle(
+            point.get("source_pages", point.get("sourcePages")),
+            page_lookup,
+            doc_page_index,
+            _extract_source_candidates(point),
+        )
+        legacy_important_points.append(
+            {
+                "title": point.get("title", "Point"),
+                "data": point.get("data", point.get("value")),
+                "source_pages": source_pages,
+                "source_citations": source_citations,
+            }
+        )
+
+    utilization_candidates = [
+        ("TSN", util_in.get("total_time_since_new")),
+        ("CSN", util_in.get("total_cycles_since_new")),
+        ("TSO", util_in.get("time_since_overhaul")),
+        ("CSO", util_in.get("cycles_since_overhaul")),
+        ("Last Activity Date", util_in.get("last_activity_date")),
+    ]
+    for title, value in utilization_candidates:
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            value = value.get("value")
+        legacy_important_points.append(
+            {
+                "title": title,
+                "data": value,
+                "source_pages": [],
+                "source_citations": [],
+            }
+        )
+    for finding in legacy_key_findings:
+        if len(legacy_important_points) >= legacy_policy["min_important_points"]:
+            break
+        legacy_important_points.append(
+            {
+                "title": "Finding",
+                "data": finding.get("finding"),
+                "source_pages": finding.get("source_pages", []),
+                "source_citations": finding.get("source_citations", []),
+            }
+        )
+    legacy_important_points = _dedupe_text_rows(legacy_important_points, "data")
+
+    legacy_modules = config_in.get("modules") if isinstance(config_in.get("modules"), list) else []
+    legacy_accessories = config_in.get("accessories") if isinstance(config_in.get("accessories"), list) else []
+    if not legacy_modules:
+        for component in legacy_components:
+            legacy_modules.append(
+                {
+                    "name": component.get("name"),
+                    "part_number": component.get("part_number"),
+                    "serial_number": component.get("serial_number"),
+                    "status": component.get("status"),
+                    "tsn": (component.get("utilization", {}).get("tsn", {}) or {}).get("value")
+                    if isinstance(component.get("utilization"), dict)
+                    else None,
+                    "tso": (component.get("utilization", {}).get("tso", {}) or {}).get("value")
+                    if isinstance(component.get("utilization"), dict)
+                    else None,
+                    "notes": None,
+                    "source_pages": component.get("source_pages", []),
+                    "source_citations": component.get("source_citations", []),
+                }
+            )
+    if not legacy_accessories:
+        for component in legacy_components:
+            name = str(component.get("name", "")).lower()
+            category = str(component.get("category", "")).upper()
+            if "accessor" in name or category in {"AVIONICS", "ELECTRICAL", "SAFETY_EQUIPMENT"}:
+                legacy_accessories.append(
+                    {
+                        "component": component.get("name"),
+                        "part_number": component.get("part_number"),
+                        "serial_number": component.get("serial_number"),
+                        "status": component.get("status"),
+                        "source_pages": component.get("source_pages", []),
+                        "source_citations": component.get("source_citations", []),
+                    }
+                )
+
+    legacy_output = {
+        "asset_id": canonical_output["asset_id"],
+        "metadata": canonical_output["metadata"],
+        "asset_name": canonical_output["asset_name"],
+        "asset_identification": {
+            "model": ai_in.get("model"),
+            "model_source_pages": model_pages,
+            "model_source_citations": model_citations,
+            "serial_number": ai_in.get("serial_number"),
+            "serial_number_source_pages": serial_pages,
+            "serial_number_source_citations": serial_citations,
+            "asset_type": ai_in.get("asset_type", payload.get("asset_type")),
+            "asset_type_source_pages": asset_type_pages,
+            "asset_type_source_citations": asset_type_citations,
+            "part_number": ai_in.get("part_number"),
+            "part_number_source_pages": part_pages,
+            "part_number_source_citations": part_citations,
+            "status": _asset_status(ai_in.get("status", payload.get("status"))),
+            "status_source_pages": status_pages,
+            "status_source_citations": status_citations,
+        },
+        "executive_summary": {
+            "operational_state": es_in.get("operational_state")
+            or (legacy_key_findings[0]["finding"] if legacy_key_findings else None),
+            "operational_state_source_pages": operational_pages,
+            "operational_state_source_citations": operational_citations,
+            "last_operator": es_in.get("last_operator"),
+            "last_operator_source_pages": operator_pages,
+            "last_operator_source_citations": operator_citations,
+            "location": es_in.get("location"),
+            "location_source_pages": location_pages,
+            "location_source_citations": location_citations,
+            "data_confidence": es_in.get("data_confidence", "MEDIUM"),
+            "preservation_status": es_in.get("preservation_status"),
+            "preservation_status_source_pages": preservation_pages,
+            "preservation_status_source_citations": preservation_citations,
+        },
+        "utilization_metrics": {
+            "total_time_since_new": _metric(util_in.get("total_time_since_new"), "hours"),
+            "total_time_since_new_source_pages": tsn_pages,
+            "total_time_since_new_source_citations": tsn_citations,
+            "total_cycles_since_new": _metric(util_in.get("total_cycles_since_new"), "cycles"),
+            "total_cycles_since_new_source_pages": csn_pages,
+            "total_cycles_since_new_source_citations": csn_citations,
+            "time_since_overhaul": _metric(util_in.get("time_since_overhaul"), "hours"),
+            "time_since_overhaul_source_pages": tso_pages,
+            "time_since_overhaul_source_citations": tso_citations,
+            "cycles_since_overhaul": _metric(util_in.get("cycles_since_overhaul"), "cycles"),
+            "cycles_since_overhaul_source_pages": cso_pages,
+            "cycles_since_overhaul_source_citations": cso_citations,
+            "last_activity_date": util_in.get("last_activity_date"),
+            "last_activity_date_source_pages": last_activity_pages,
+            "last_activity_date_source_citations": last_activity_citations,
+            "notes": util_in.get("notes"),
+        },
+        "components": legacy_components,
+        "configuration": {
+            "modules": legacy_modules,
+            "accessories": legacy_accessories,
+        },
+        "risk_assessment": {
+            "critical_risks": critical_risks,
+            "documentation_gaps": documentation_gaps,
+        },
+        "key_findings": legacy_key_findings,
+        "important_points": legacy_important_points,
+        # Preserve richer current-agent sections in dual-mode output.
+        "regulatory_validation": canonical_output["regulatory_validation"],
+        "gaps": canonical_output["gaps"],
+        "contradictions": canonical_output["contradictions"],
+        "recommendations": canonical_output["recommendations"],
+        "notes": canonical_output["notes"],
+        "_research_metadata": canonical_output["_research_metadata"],
+        "_canvas_stats": canonical_output["_canvas_stats"],
+        "_raw_model_output": canonical_output["_raw_model_output"],
+    }
+
+    cited_pages = {
+        idx
+        for section in (
+            legacy_key_findings,
+            legacy_important_points,
+            legacy_components,
+            critical_risks,
+            documentation_gaps,
+        )
+        for idx in (
+            section.get("source_pages", [])
+            if isinstance(section, dict)
+            else [
+                i
+                for row in section
+                if isinstance(row, dict)
+                for i in row.get("source_pages", [])
+            ]
+        )
+        if isinstance(idx, int)
+    }
+    total_pages = int(asset_context.get("total_pages", 0) or 0)
+    uncited_ratio = (max(total_pages - len(cited_pages), 0) / total_pages) if total_pages > 0 else 0.0
+    legacy_output["_coverage"] = {
+        "total_pages": total_pages,
+        "cited_page_count": len(cited_pages),
+        "uncited_page_ratio": round(uncited_ratio, 3),
+        "adaptive_policy": legacy_policy,
+        "second_pass_triggered": uncited_ratio > 0.8 and total_pages >= 25,
+    }
+
+    return legacy_output
 
 
 async def get_asset_context(asset_id: str) -> dict:
@@ -867,11 +1602,35 @@ def _get_mock_asset_context(asset_id: str) -> dict:
     }
 
 
-async def main():
-    """Main entry point."""
-    args = parse_args()
+async def run_asset_research_programmatic(
+    asset_id: str,
+    prompt: str = "Produce a comprehensive analysis of this asset dossier",
+    depth: str = "standard",
+) -> dict[str, Any]:
+    """
+    Programmatic entry point for API use.
+    Returns the research output dict without saving to file.
+    """
+    from argparse import Namespace
+
+    args = Namespace(
+        config="configs/config_asset_research.py",
+        asset_id=asset_id,
+        prompt=prompt,
+        depth=depth,
+        output=None,
+        stream=False,
+        verbose=False,
+        live_monitor=False,
+        cfg_options=[],
+    )
+    return await _execute_research(args, save_to_file=True)
+
+
+async def _execute_research(args, save_to_file: bool = True) -> dict[str, Any]:
+    """Core research execution - shared by CLI and API."""
     start_time = datetime.utcnow()
-    
+
     print(f"\n{'='*60}")
     print("  Asset Dossier Research Agent")
     print(f"{'='*60}\n")
@@ -884,9 +1643,9 @@ async def main():
     print(f"Loading configuration from: {args.config}")
     config.init_config(args.config, args)
 
-    # Fallback to OpenAI if Anthropic key is missing
+    # Fallback from Anthropic to Gemini/OpenAI when Anthropic key is missing.
     if not os.getenv("ANTHROPIC_API_KEY"):
-        fallback_model_id = "gpt-4.1"
+        fallback_model_id = "gemini-3-pro-preview" if os.getenv("GOOGLE_API_KEY") else "gpt-4.1"
         for key in [
             "agent_config",
             "planning_agent_config",
@@ -931,7 +1690,18 @@ async def main():
         auto_summarize=config.get("canvas_config", {}).get("auto_summarize", True)
     )
     CanvasTool.set_shared_canvas(canvas)
-    
+
+    # 5b. Create run_dir early when saving, so we can persist canvas after each step
+    run_dir = None
+    output_path = None
+    canvas_path = None
+    if save_to_file:
+        run_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        run_dir = Path("workdir") / f"asset_research_{args.asset_id}_{run_stamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        output_path = args.output or str(run_dir / "output.json")
+        canvas_path = str(run_dir / "canvas.json")
+
     # 6. Get asset context
     print(f"Fetching asset context for: {args.asset_id}")
     try:
@@ -954,6 +1724,7 @@ async def main():
     os.environ["ASSET_ID"] = args.asset_id
     
     # 7. Build the task with context
+    coverage_requirements = _build_richness_requirements(int(asset_context.get("total_pages", 0) or 0))
     task = f"""
 ## Asset Dossier Research Task
 
@@ -976,6 +1747,7 @@ async def main():
 3. Report confidence levels for each finding
 4. Identify gaps and contradictions
 5. Output must be valid JSON matching AssetResearchOutput schema
+{coverage_requirements}
 """
     
     print(f"\n{'='*60}")
@@ -984,7 +1756,20 @@ async def main():
     
     # 8. Create agent
     agent = await create_agent(config)
-    
+
+    # 8b. Register step callback to persist canvas after each agent step
+    if save_to_file and canvas_path:
+
+        def _save_canvas_after_step(memory_step, agent=None):
+            if canvas.entries:
+                try:
+                    canvas.save_to_file(canvas_path)
+                    logger.debug(f"Canvas persisted ({len(canvas.entries)} entries) after step")
+                except Exception as e:
+                    logger.warning(f"Failed to persist canvas after step: {e}")
+
+        agent.step_callbacks.append(_save_canvas_after_step)
+
     # 9. Run the agent
     try:
         additional_args = {
@@ -1014,7 +1799,7 @@ async def main():
                 task=task,
                 agent_memory=agent.memory,
                 reformulation_model=model_manager.registed_models.get(
-                    config.get("reformulation_model_id", "gpt-4.1")
+                    config.get("reformulation_model_id", "gemini-3-pro-preview")
                 )
             )
         else:
@@ -1177,11 +1962,7 @@ async def main():
             }
         }
     
-    # 12. Save output
-    run_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path("workdir") / f"asset_research_{args.asset_id}_{run_stamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    output_path = args.output or str(run_dir / "output.json")
+    # 12. Save output (run_dir/output_path already set in step 5b when save_to_file)
     
     # Final validation: ensure output is proper JSON structure, not stringified
     # Check for old structure and fix it
@@ -1284,8 +2065,10 @@ async def main():
 
     # Canonicalize output into one stable schema and enrich source citations.
     page_ids: set[str] = set()
+    page_indices: set[int] = set()
     _collect_page_ids(output, page_ids)
-    page_lookup = await _fetch_page_lookup(page_ids)
+    _collect_source_page_indices(output, page_indices)
+    page_lookup = await _fetch_page_lookup(page_ids, args.asset_id, page_indices)
     output = _canonicalize_output(
         payload=output,
         args=args,
@@ -1295,36 +2078,40 @@ async def main():
         canvas_stats=output.get("_canvas_stats", {}),
     )
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, default=str, ensure_ascii=False)
-    
-    # Save canvas if it has entries
-    if canvas.entries:
-        canvas_path = str(run_dir / "canvas.json")
-        canvas.save_to_file(canvas_path)
-        print(f"Canvas saved to: {canvas_path}")
-    
-    # 13. Print summary
-    print(f"\n{'='*60}")
-    print("  Execution Complete")
-    print(f"{'='*60}\n")
-    
-    print(f"Output saved to: {output_path}")
-    print(f"Run folder: {run_dir}")
-    print(f"Processing time: {processing_time/1000:.1f}s")
-    
-    # Print execution summary
-    print_execution_summary(emitter.get_history())
-    
-    # Stop live monitor if running
-    if args.live_monitor:
-        try:
-            monitor.stop()
-        except:
-            pass
-    
-    logger.info(f"Research complete. Output saved to: {output_path}")
-    
+    if save_to_file:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2, default=str, ensure_ascii=False)
+
+        # Save canvas if it has entries
+        if canvas.entries:
+            canvas_path = str(run_dir / "canvas.json")
+            canvas.save_to_file(canvas_path)
+            print(f"Canvas saved to: {canvas_path}")
+
+    # 13. Print summary (skip when API mode)
+    if save_to_file:
+        print(f"\n{'='*60}")
+        print("  Execution Complete")
+        print(f"{'='*60}\n")
+        print(f"Output saved to: {output_path}")
+        print(f"Run folder: {run_dir}")
+        print(f"Processing time: {processing_time/1000:.1f}s")
+        print_execution_summary(emitter.get_history())
+        if args.live_monitor:
+            try:
+                monitor.stop()
+            except Exception:
+                pass
+        logger.info(f"Research complete. Output saved to: {output_path}")
+
+    return output
+
+
+async def main():
+    """CLI entry point."""
+    args = parse_args()
+    output = await _execute_research(args)
+    # _execute_research already saves and prints when run from CLI
     return output
 
 

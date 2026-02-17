@@ -11,7 +11,7 @@ _ASSET_PAGE_READ_DESCRIPTION = """Read the full extracted content from specific 
 
 Input can be:
 - A list of page IDs
-- A document path with page range
+- A document path with page range (start/end treated as inclusive)
 
 Returns the complete extracted_json content for each page, including:
 - Extracted text and structured data
@@ -46,7 +46,7 @@ class AssetPageReadTool(AsyncTool):
                     "start": {"type": "integer"},
                     "end": {"type": "integer"}
                 },
-                "description": "Page range within document (0-indexed)",
+                "description": "Page range within document (0-indexed, inclusive start/end)",
                 "nullable": True
             },
             "include_raw_text": {
@@ -77,14 +77,61 @@ class AssetPageReadTool(AsyncTool):
             
             pages_to_fetch = []
             
-            # Method 1: Direct page IDs
-            if page_ids:
+            # When both document_id and page_ids are present and page_ids look like indices
+            # (e.g. ["1","2","3"]), treat them as page_index values, not UUIDs.
+            if document_id and page_ids and all(
+                str(p).strip().isdigit() for p in page_ids[:self.max_pages_per_request]
+            ):
+                page_indices = [int(str(p).strip()) for p in page_ids[:self.max_pages_per_request]]
+                page_records = await db.fetch(
+                    """
+                    SELECT id FROM document_pages
+                    WHERE document_id = $1 AND page_index = ANY($2)
+                    ORDER BY page_index
+                    LIMIT $3
+                    """,
+                    document_id,
+                    page_indices,
+                    self.max_pages_per_request,
+                )
+                pages_to_fetch = [str(row["id"]) for row in page_records]
+                # Fallback: if no rows, try page_range with min/max indices (handles 0-based vs 1-based)
+                if not pages_to_fetch and page_indices:
+                    lo, hi = min(page_indices), max(page_indices)
+                    page_records = await db.fetch(
+                        """
+                        SELECT id FROM document_pages
+                        WHERE document_id = $1 AND page_index >= $2 AND page_index <= $3
+                        ORDER BY page_index
+                        LIMIT $4
+                        """,
+                        document_id,
+                        max(0, lo - 1),
+                        hi,
+                        self.max_pages_per_request,
+                    )
+                    pages_to_fetch = [str(row["id"]) for row in page_records]
+            
+            # Method 1: Direct page IDs (UUIDs only when document_id not used for indices)
+            elif page_ids:
                 pages_to_fetch = page_ids[:self.max_pages_per_request]
             
             # Method 2: Document + page range
             elif document_id:
+                # Treat page_range as inclusive bounds to match natural tool-calling behavior.
                 start_page = page_range.get("start", 0) if page_range else 0
-                end_page = page_range.get("end", start_page + self.max_pages_per_request) if page_range else start_page + self.max_pages_per_request
+                start_page = max(int(start_page), 0)
+
+                if page_range and page_range.get("end") is not None:
+                    requested_end = int(page_range["end"])
+                else:
+                    requested_end = start_page + self.max_pages_per_request - 1
+
+                if requested_end < start_page:
+                    requested_end = start_page
+
+                # Clamp to max pages per request.
+                end_page = min(requested_end, start_page + self.max_pages_per_request - 1)
                 
                 # Get page IDs for the range
                 page_records = await db.fetch("""
@@ -92,13 +139,24 @@ class AssetPageReadTool(AsyncTool):
                     FROM document_pages
                     WHERE document_id = $1
                     AND page_index >= $2
-                    AND page_index < $3
+                    AND page_index <= $3
                     ORDER BY page_index
                 """, document_id, start_page, end_page)
                 
                 pages_to_fetch = [str(row["id"]) for row in page_records]
             
             if not pages_to_fetch:
+                if document_id:
+                    return ToolResult(
+                        output={
+                            "pages": [],
+                            "count": 0,
+                            "warning": (
+                                f"No pages found for document_id={document_id} "
+                                f"with page_range={page_range or {'start': 0, 'end': self.max_pages_per_request - 1}}."
+                            ),
+                        },
+                    )
                 return ToolResult(
                     output={"pages": [], "count": 0},
                     error="No pages specified. Provide either page_ids or document_id with page_range."
@@ -141,8 +199,16 @@ class AssetPageReadTool(AsyncTool):
                         "page_id": str(row["page_id"]),
                         "document_id": str(row["document_id"]),
                         "document_name": row["document_name"] or row["document_path"],
-                        "page_index": row["page_index"]
-                    }
+                        "page_index": row["page_index"],
+                        "enhanced_s3_key": row.get("enhanced_s3_key"),
+                    },
+                    "source_citation": {
+                        "page_id": str(row["page_id"]),
+                        "document_id": str(row["document_id"]),
+                        "document_name": row["document_name"] or row["document_path"],
+                        "page_index": row["page_index"],
+                        "enhanced_s3_key": row.get("enhanced_s3_key"),
+                    },
                 }
                 
                 # Parse extracted_json

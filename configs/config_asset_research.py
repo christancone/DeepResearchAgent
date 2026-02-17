@@ -19,6 +19,9 @@ use_local_proxy = False
 
 use_hierarchical_agent = True
 
+# Set to True to enable regulatory web research (deep_researcher_tool); False to skip (avoids Firecrawl/API errors)
+use_regulatory_researcher = False
+
 # ============================================================================
 # CONTEXT & MEMORY CONFIGURATION
 # ============================================================================
@@ -69,7 +72,7 @@ observability_config = dict(
 asset_extractor_agent_config = dict(
     type="asset_extractor_agent",
     name="asset_extractor_agent",
-    model_id="claude-3.7-sonnet-thinking",
+    model_id="gemini-3-pro-preview",
     description="Specialized agent for extracting structured data from asset dossiers with full citation tracking.",
     max_steps=20,
     template_path="src/agent/asset_extractor_agent/prompts/asset_extractor_agent.yaml",
@@ -85,7 +88,6 @@ asset_extractor_agent_config = dict(
         "canvas_tool",
         # Existing tools for processing
         "python_interpreter_tool",
-        "file_reader_tool"
     ]
 )
 
@@ -95,7 +97,7 @@ asset_extractor_agent_config = dict(
 deep_researcher_agent_config = dict(
     type="deep_researcher_agent",
     name="regulatory_researcher_agent",
-    model_id="gpt-4.1",
+    model_id="gemini-3-pro-preview",
     description="Specialized regulatory research agent for validating ADs, SBs, and compliance against FAA/EASA databases.",
     max_steps=15,
     template_path="src/agent/asset_research_prompts/regulatory_researcher.yaml",
@@ -115,7 +117,7 @@ deep_researcher_agent_config = dict(
 deep_analyzer_agent_config = dict(
     type="deep_analyzer_agent",
     name="document_analyzer_agent",
-    model_id="claude-3.7-sonnet-thinking",
+    model_id="gemini-3-pro-preview",
     description="Specialized document analysis agent for cross-referencing, trend analysis, and contradiction detection.",
     max_steps=15,
     template_path="src/agent/asset_research_prompts/document_analyzer.yaml",
@@ -123,7 +125,11 @@ deep_analyzer_agent_config = dict(
     tools=[
         "deep_analyzer_tool",      # EXISTING: multi-model analysis
         "python_interpreter_tool", # EXISTING: calculations and data processing
-        "file_reader_tool",        # EXISTING: read various file formats
+        # DB-backed dossier access (avoid local filesystem reads)
+        "asset_rag_search_tool",
+        "asset_page_read_tool",
+        "document_tree_tool",
+        "asset_batch_summary_tool",
         "canvas_tool",             # Working memory
     ]
 )
@@ -134,7 +140,7 @@ deep_analyzer_agent_config = dict(
 browser_use_agent_config = dict(
     type="browser_use_agent",
     name="regulatory_scraper_agent",
-    model_id="gpt-4.1",
+    model_id="gemini-3-pro-preview",
     description="Specialized browser agent for scraping FAA/EASA regulatory websites when APIs are unavailable.",
     max_steps=10,
     template_path="src/agent/asset_research_prompts/regulatory_scraper.yaml",
@@ -151,7 +157,7 @@ browser_use_agent_config = dict(
 planning_agent_config = dict(
     type="planning_agent",
     name="asset_research_orchestrator",
-    model_id="claude-3.7-sonnet-thinking",
+    model_id="gemini-3-pro-preview",
     description="Orchestrator agent that coordinates multi-phase research on asset dossiers.",
     max_steps=30,
     template_path="src/agent/asset_research_prompts/orchestrator.yaml",
@@ -162,7 +168,7 @@ planning_agent_config = dict(
     ],
     managed_agents=[
         "asset_extractor_agent",
-        "deep_researcher_agent",   # registry key; display name "regulatory_researcher_agent" from deep_researcher_agent_config
+        *(["deep_researcher_agent"] if use_regulatory_researcher else []),
         "deep_analyzer_agent",    # registry key; display name "document_analyzer_agent" from deep_analyzer_agent_config
         # "browser_use_agent"     # Uncomment if browser scraping is needed
     ]

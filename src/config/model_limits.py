@@ -256,6 +256,16 @@ MODEL_LIMITS: Dict[str, ModelLimits] = {
         cost_per_1k_output=0.0004,
         supports_vision=True
     ),
+    "gemini-3-pro-preview": ModelLimits(
+        model_id="gemini-3-pro-preview",
+        context_window=1_000_000,
+        max_output_tokens=8_192,
+        input_reserve=5_000,
+        tokenizer="gemini",
+        cost_per_1k_input=0.0,
+        cost_per_1k_output=0.0,
+        supports_vision=True
+    ),
     
     # =========================================================================
     # Open Source Models (via LiteLLM/vLLM/Ollama)
@@ -374,6 +384,7 @@ MODEL_ALIASES: Dict[str, str] = {
     "claude-3-opus-latest": "claude-3-opus",
     "gemini-pro": "gemini-1.5-pro",
     "gemini-flash": "gemini-1.5-flash",
+    "gemini/gemini-3-pro-preview": "gemini-3-pro-preview",
 }
 
 
