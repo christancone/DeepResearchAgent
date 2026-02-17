@@ -59,6 +59,19 @@ if TYPE_CHECKING:
 from src.logger import logger
 
 
+def _normalize_schema_value(value: Any) -> Any:
+    """Normalize schema values to avoid callable/json-schema serialization issues."""
+    if callable(value):
+        return getattr(value, "__name__", "callable")
+    if isinstance(value, dict):
+        return {k: _normalize_schema_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_normalize_schema_value(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 def validate_after_init(cls):
     original_init = cls.__init__
 
@@ -164,6 +177,9 @@ class Tool:
         validate_after_init(cls)
 
     def validate_arguments(self):
+        # Normalize schema payload up front so downstream JSON-schema generation
+        # never receives callable objects or other non-serializable values.
+        self.parameters = _normalize_schema_value(self.parameters)
         required_attributes = {
             "description": str,
             "name": str,

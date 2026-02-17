@@ -295,6 +295,15 @@ class ModelManager(metaclass=Singleton):
                     "model_name": "claude37-sonnet-thinking",
                     "model_id": "claude-3-7-sonnet-20250219",
                 },
+                # Aliases used in configs
+                {
+                    "model_name": "claude-3.7-sonnet",
+                    "model_id": "claude-3-7-sonnet-20250219",
+                },
+                {
+                    "model_name": "claude-3.7-sonnet-thinking",
+                    "model_id": "claude-3-7-sonnet-20250219",
+                },
             ]
             
             for model in models:
@@ -314,6 +323,22 @@ class ModelManager(metaclass=Singleton):
             api_key = self._check_local_api_key(local_api_key_name="SKYWORK_API_KEY", 
                                                 remote_api_key_name="GOOGLE_API_KEY")
             
+            # gemini-3-pro-preview
+            model_name = "gemini-3-pro-preview"
+            model_id = "gemini/gemini-3-pro-preview"
+            client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=self._check_local_api_base(local_api_base_name="SKYWORK_OPENROUTER_BJ_API_BASE",
+                                                    remote_api_base_name="GOOGLE_API_BASE"),
+                http_client=ASYNC_HTTP_CLIENT,
+            )
+            model = OpenAIServerModel(
+                model_id=model_id,
+                http_client=client,
+                custom_role_conversions=custom_role_conversions,
+            )
+            self.registed_models[model_name] = model
+
             # gemini-2.5-pro
             model_name = "gemini-2.5-pro"
             model_id = "gemini-2.5-pro-preview-06-05"
@@ -380,6 +405,10 @@ class ModelManager(metaclass=Singleton):
                                                     remote_api_base_name="GOOGLE_API_BASE")
             
             models = [
+                {
+                    "model_name": "gemini-3-pro-preview",
+                    "model_id": "gemini/gemini-3-pro-preview",
+                },
                 {
                     "model_name": "gemini-2.5-pro",
                     "model_id": "gemini-2.5-pro-preview-06-05",

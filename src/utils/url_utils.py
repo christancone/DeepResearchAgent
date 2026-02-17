@@ -1,13 +1,38 @@
 import os
 from typing import Optional
+from dataclasses import dataclass
 from dotenv import load_dotenv
 load_dotenv(verbose=True)
 
-from markitdown._base_converter import DocumentConverterResult
-from crawl4ai import AsyncWebCrawler
-from firecrawl import FirecrawlApp
+# Try to import DocumentConverterResult from markitdown, fallback to local dataclass
+try:
+    from markitdown._base_converter import DocumentConverterResult
+except ImportError:
+    @dataclass
+    class DocumentConverterResult:
+        """Fallback dataclass when markitdown is not available."""
+        markdown: str = ""
+        title: str = ""
+
+# Optional imports for web crawling
+try:
+    from crawl4ai import AsyncWebCrawler
+    CRAWL4AI_AVAILABLE = True
+except ImportError:
+    AsyncWebCrawler = None
+    CRAWL4AI_AVAILABLE = False
+
+try:
+    from firecrawl import FirecrawlApp
+    FIRECRAWL_AVAILABLE = True
+except ImportError:
+    FirecrawlApp = None
+    FIRECRAWL_AVAILABLE = False
+
 
 async def firecrawl_fetch_url(url: str):
+    if not FIRECRAWL_AVAILABLE:
+        return None
     try:
         app = FirecrawlApp(api_key=os.getenv("FIRECRAWL_API_KEY", None))
 
@@ -23,6 +48,8 @@ async def firecrawl_fetch_url(url: str):
 
 async def fetch_crawl4ai_url(url: str):
     """Fetch content from a given URL using the crawl4ai library."""
+    if not CRAWL4AI_AVAILABLE:
+        return None
     try:
         async with AsyncWebCrawler() as crawler:
             response = await crawler.arun(

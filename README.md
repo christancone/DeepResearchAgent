@@ -153,6 +153,34 @@ git clone https://huggingface.co/datasets/gaia-benchmark/GAIA
 python examples/run_gaia.py
 ```
 
+### Asset Research API (for frontend integration)
+
+Run the FastAPI server locally for frontend integration:
+
+```bash
+# Install dependencies (includes fastapi, uvicorn)
+poetry install
+
+# Start the API server
+uvicorn api.server:app --host 0.0.0.0 --port 8000
+```
+
+**Endpoint:** `POST /api/research`
+
+Request body (only `asset_id` required from frontend):
+
+```json
+{ "asset_id": "d9d68f1c-85d5-4996-9b7f-6187134fd10c" }
+```
+
+Optional overrides:
+
+```json
+{ "asset_id": "...", "prompt": "Extract all LLPs", "depth": "comprehensive" }
+```
+
+Research can take several minutes. Use a long timeout (e.g. 10 min) or implement polling with `202 Accepted` + job queue for production.
+
 ## Experiments
 
 We evaluated our agent on both GAIA validation and test sets, achieving state-of-the-art performance. Our system demonstrates superior performance across all difficulty levels.

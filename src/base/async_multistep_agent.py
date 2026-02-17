@@ -277,6 +277,41 @@ class AsyncMultiStepAgent(ABC):
         self.step_callbacks.append(self.monitor.update_metrics)
         self.stream_outputs = False
 
+    def _get_template_vars(self) -> dict[str, Any]:
+        """Build common template variables from config/state."""
+        defaults: dict[str, Any] = {
+            "asset_id": "",
+            "asset_name": "",
+            "total_pages": 0,
+            "total_documents": 0,
+            "document_types": [],
+        }
+        config = getattr(self, "config", None)
+
+        def _read_config_value(key: str) -> Any:
+            if config is None:
+                return None
+            if isinstance(config, dict):
+                return config.get(key)
+            if hasattr(config, "get"):
+                try:
+                    value = config.get(key)
+                    if value is not None:
+                        return value
+                except Exception:
+                    pass
+            return getattr(config, key, None)
+
+        state = getattr(self, "state", {})
+        for key in list(defaults.keys()):
+            value = _read_config_value(key)
+            if value is None and isinstance(state, dict):
+                value = state.get(key)
+            if value is not None:
+                defaults[key] = value
+
+        return defaults
+
     def _validate_name(self, name: str | None) -> str | None:
         if name is not None and not is_valid_name(name):
             raise ValueError(f"Agent name '{name}' must be a valid Python identifier and not a reserved keyword.")
@@ -388,7 +423,7 @@ You have been provided with these additional arguments, that you can access usin
 
         if stream:
             # The steps are returned as they are executed through a generator to iterate on.
-            return await self._run_stream(task=self.task, max_steps=max_steps, images=images)
+            return self._run_stream(task=self.task, max_steps=max_steps, images=images)
         run_start_time = time.time()
         # Outputs are returned only at the end. We only look at the last step.
 
@@ -429,6 +464,48 @@ You have been provided with these additional arguments, that you can access usin
             )
 
         return output
+
+    def run_stream(
+        self,
+        task: str,
+        reset: bool = True,
+        images: list["PIL.Image.Image"] | None = None,
+        additional_args: dict | None = None,
+        max_steps: int | None = None,
+    ):
+        """Run the agent in streaming mode and return an async generator."""
+        max_steps = max_steps or self.max_steps
+        self.task = task
+        self.interrupt_switch = False
+        if additional_args is not None:
+            self.state.update(additional_args)
+            self.task += f"""
+You have been provided with these additional arguments, that you can access using the keys as variables in your python code:
+{str(additional_args)}."""
+        self.task = self.initialize_task_instruction()
+
+        self.system_prompt = self.initialize_system_prompt()
+        self.memory.system_prompt = SystemPromptStep(system_prompt=self.system_prompt)
+        self.user_prompt = self.initialize_user_prompt()
+        self.memory.user_prompt = UserPromptStep(user_prompt=self.user_prompt)
+
+        if reset:
+            self.memory.reset()
+            self.monitor.reset()
+
+        self.logger.log_task(
+            content=self.task.strip(),
+            subtitle=f"{type(self.model).__name__} - {(self.model.model_id if hasattr(self.model, 'model_id') else '')}",
+            level=LogLevel.INFO,
+            title=self.name if hasattr(self, "name") else None,
+        )
+        self.memory.steps.append(TaskStep(task=self.task, task_images=images))
+
+        if getattr(self, "python_executor", None):
+            self.python_executor.send_variables(variables=self.state)
+            self.python_executor.send_tools({**self.tools, **self.managed_agents})
+
+        return self._run_stream(task=self.task, max_steps=max_steps, images=images)
 
     async def _run_stream(
         self, task: str, max_steps: int, images: list["PIL.Image.Image"] | None = None
@@ -783,9 +860,15 @@ You have been provided with these additional arguments, that you can access usin
         """Adds additional prompting for the managed agent, runs it, and wraps the output.
         This method is called only by a managed agent.
         """
+        template_vars = self._get_template_vars()
         full_task = populate_template(
             self.prompt_templates["managed_agent"]["task"],
-            variables=dict(name=self.name, task=task),
+            variables={
+                "name": self.name,
+                "agent": {"name": self.name},
+                "task": task,
+                **template_vars,
+            },
         )
         result = await self.run(full_task, **kwargs)
         if isinstance(result, RunResult):
@@ -793,7 +876,13 @@ You have been provided with these additional arguments, that you can access usin
         else:
             report = result
         answer = populate_template(
-            self.prompt_templates["managed_agent"]["report"], variables=dict(name=self.name, final_answer=report)
+            self.prompt_templates["managed_agent"]["report"],
+            variables={
+                "name": self.name,
+                "agent": {"name": self.name},
+                "final_answer": report,
+                **template_vars,
+            },
         )
         if self.provide_run_summary:
             answer += "\n\nFor more detail, find below a summary of this agent's work:\n<summary_of_work>\n"

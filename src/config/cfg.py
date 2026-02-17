@@ -10,6 +10,11 @@ from src.logger import logger
 
 def process_general(config: MMConfig) -> MMConfig:
 
+    # Ensure base workdir exists first
+    workdir_path = assemble_project_path(config.workdir)
+    os.makedirs(workdir_path, exist_ok=True)
+    
+    # Then create the experiment-specific subdirectory
     config.exp_path = assemble_project_path(os.path.join(config.workdir, config.tag))
     os.makedirs(config.exp_path, exist_ok=True)
 
@@ -39,8 +44,15 @@ class Config(MMConfig, metaclass=Singleton):
         mmconfig = MMConfig.fromfile(filename=assemble_project_path(config_path))
         if 'cfg_options' not in args or args.cfg_options is None:
             cfg_options = dict()
+        elif isinstance(args.cfg_options, list):
+            # Parse key=value list from argparse (e.g. --cfg-options key1=val1 key2=val2)
+            cfg_options = dict()
+            for opt in args.cfg_options:
+                if "=" in opt:
+                    k, v = opt.split("=", 1)
+                    cfg_options[k.strip()] = v.strip()
         else:
-            cfg_options = args.cfg_options
+            cfg_options = dict(args.cfg_options)
         for item in args.__dict__:
             if item not in ['config', 'cfg_options'] and args.__dict__[item] is not None:
                 cfg_options[item] = args.__dict__[item]

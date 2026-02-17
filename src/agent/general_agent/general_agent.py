@@ -92,26 +92,29 @@ class GeneralAgent(AsyncMultiStepAgent):
 
     def initialize_system_prompt(self) -> str:
         """Initialize the system prompt for the agent."""
+        template_vars = self._get_template_vars()
         system_prompt = populate_template(
             self.prompt_templates["system_prompt"],
-            variables={"tools": self.tools, "managed_agents": self.managed_agents},
+            variables={"tools": self.tools, "managed_agents": self.managed_agents, **template_vars},
         )
         return system_prompt
 
     def initialize_user_prompt(self) -> str:
 
+        template_vars = self._get_template_vars()
         user_prompt = populate_template(
             self.prompt_templates["user_prompt"],
-            variables={},
+            variables={**template_vars},
         )
 
         return user_prompt
 
     def initialize_task_instruction(self) -> str:
         """Initialize the task instruction for the agent."""
+        template_vars = self._get_template_vars()
         task_instruction = populate_template(
             self.prompt_templates["task_instruction"],
-            variables={"task": self.task},
+            variables={"task": self.task, **template_vars},
         )
         return task_instruction
 
